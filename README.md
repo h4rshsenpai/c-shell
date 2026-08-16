@@ -42,9 +42,8 @@ Due Date - 24 Aug
 
 ### B1: hop 
 ### B2: reveal
-### B3: peek
+### B3: pee
 ### B4: locate
-
 ## Part C: File Redirection + Pipes -- 50 marks
 
 ### C1: Command Execution -- 8 marks 
