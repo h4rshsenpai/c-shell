@@ -7,12 +7,8 @@ BUILD_DIR = build
 SRC_DIR = src
 INC_DIR = include
 
-SRCS = $(SRC_DIR)/parser.c \
-	$(SRC_DIR)/prompt.c \
-	$(SRC_DIR)/input.c \
-	$(SRC_DIR)/util.c \
-	$(SRC_DIR)/builtins.c \
-	$(SRC_DIR)/exec.c \
+SRCS = $(SRC_DIR)/main.c \
+	   $(SRC_DIR)/prompt.c \
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
