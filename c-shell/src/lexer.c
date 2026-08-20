@@ -27,10 +27,22 @@ int append_token(Token* tok, Token** out_tokens, size_t *count) {
     return 0;
 }
 
+void free_tokens(Token* tokens, size_t count) {
+    if (!tokens) return;
+    
+    // only WORD tokens carry body, rest are NULL so free doesn't do anything
+    for (size_t i=0; i < count; i++) 
+        free(tokens[i].body);
+    
+    free(tokens);
+}
+
 // TODO ---- add extra flags for error checking 
 ssize_t tokenize(const char* p, Token **out_tokens) {
     size_t count = 0;  // tracks number of valid tokens
     int status;         // return value for append_token, read_word and read_op
+
+    *out_tokens = NULL;
 
     helper_trim(&p);
     while (p && *p != '\0') {
@@ -42,12 +54,19 @@ ssize_t tokenize(const char* p, Token **out_tokens) {
         else                            // only possibility is WORD
             status = read_word(&tok, &p);
 
-        if (status != 0)    // 1 - invalid syntax, 2 - memory error
+        if (status != 0) {  // 1 - invalid syntax, 2 - memory error
+            free_tokens(*out_tokens, count);
+            *out_tokens = NULL;
             return -1*status;
+        }
 
         status = append_token(&tok, out_tokens, &count);
-        if (status) 
-            return -2;                          // realloc issue
+        if (status) {   // realloc issue
+            free(tok.body);
+            free_tokens(*out_tokens, count);
+            *out_tokens = NULL;
+            return -2;            
+        }
         helper_trim(&p);
     }
     return count;

@@ -38,11 +38,31 @@ int consume_and_next(Token tok, Command *cmd, size_t* pos) {
     return 0;
 }
 
+void free_command_chain(Command *cmd) {
+    while (cmd) {
+        Command *next = cmd->next;
+        
+        for (int i = 0; i < cmd->argc; i++)
+            free(cmd->argv[i]);
+        free(cmd->argv);
+        
+        for (int i = 0; i < cmd->n_ins; i++)
+            free(cmd->ins[i]);
+        free(cmd->ins);
+        
+        for (int i = 0; i < cmd->n_outs; i++)
+            free(cmd->outs[i].path);
+        free(cmd->outs);
+
+        free(cmd);
+        cmd = next;
+    }
+}
+
 int run_parser(const Token *tokens, size_t n, Command **out_cmd) {
    
-    printf("hello\n");
     if (n == 0) 
-        return 0;       // empty input valid
+        return 0; // empty input valid
     
     int status;
     size_t pos = 0;
@@ -55,21 +75,25 @@ int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd) {
         return 1; 
  
     Command *next_cmd = (Command *)calloc(1, sizeof(Command));
-    if (!next_cmd) return 2;  
+    if (!next_cmd) 
+        return 2;  
     
     // 1. consume WORD
     if (consume_and_next(tokens[*pos], next_cmd, pos)) { 
-        free(next_cmd); 
+        free_command_chain(next_cmd);
+        *out_cmd = NULL;
         return 2; 
     }
 
     // 2. add command to chain, node links are handled by parse_arg
     *out_cmd = next_cmd; 
 
-    // 3. ARG case
+    // 3. parse ARG
     int status = parse_arg(tokens, n, pos, next_cmd);
     if (status != 0) {
-        // Proper cleanup for head
+        // free this node and anything parse_arg linked below it
+        // deeper nodes that failed are expected to be freed by their own parse_cmd
+        free_command_chain(next_cmd);
         return status;
     }
     return 0;
@@ -78,10 +102,10 @@ int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd) {
 int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
     
     if (*pos >= n)
-        return 0;   // ε case - nothing follows
+        return 0; // ε case - nothing follows
 
     int status;
-    Command *next_cmd = NULL;       // only meaningful if complex command
+    Command *next_cmd = NULL; // only meaningful if complex command
     switch(tokens[*pos].type) {
 
         case WORD:
@@ -95,11 +119,10 @@ int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
             return parse_tgt(tokens, n, pos, cmd);
         
         case OP_PIPE:
-            (*pos)++;           // consume '|' 
+            (*pos)++; // consume '|' 
             
             cmd->connector = '|';
             
-            // Command *next_cmd = NULL;
             status = parse_cmd(tokens, n, pos, &next_cmd);
             if (status) 
                 return status;
@@ -108,7 +131,7 @@ int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
             return 0;
 
         case OP_SEMI:
-            (*pos)++;           // consume ';' 
+            (*pos)++; // consume ';' 
             
             cmd->connector = ';';
 
@@ -121,7 +144,7 @@ int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
             return 0;
         
         case OP_AMP:
-            (*pos)++;           // consume '&'
+            (*pos)++; // consume '&'
             return parse_bg(tokens, n, pos, cmd);
         
         default:
@@ -141,7 +164,8 @@ int parse_bg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
     // WORD ARG case - new command follows
     Command *next_cmd;
     int status = parse_cmd(tokens, n, pos, &next_cmd);
-    if (status) return status;
+    if (status)
+        return status;
     
     cmd->connector = '&';
     cmd->next = next_cmd;
@@ -157,11 +181,13 @@ int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
 
     // copy WORD - filename/path for redirection
     char *copy = strdup(tokens[*pos].body); 
-    if (!copy) return 2;
+    if (!copy) 
+        return 2;
 
     if (op == OP_LT) {
         char **temp = realloc(cmd->ins, (cmd->n_ins + 2) * sizeof(char*));  // **ins must be NULL terminated 
         if (!temp) return 2;
+
         cmd->ins = temp;
 
         cmd->ins[cmd->n_ins] = copy;
@@ -171,6 +197,7 @@ int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
     else {
         Outfile *temp = realloc(cmd->outs, (cmd->n_outs + 2) * sizeof(Outfile));
         if (!temp) return 2;
+        
         cmd->outs = temp;
 
         cmd->outs[cmd->n_outs].path = copy;

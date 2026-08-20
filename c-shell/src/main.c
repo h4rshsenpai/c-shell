@@ -32,11 +32,11 @@ int main() {
         if (len == 0) { free(line); continue; } // empty input is valid
 
         // pass input to lexer
-        Token* tokens = NULL; 
-
+        Token* tokens; 
         ssize_t n = tokenize(line, &tokens);
+        
         if (n < 0) {                    // syntax error or out of memory
-            free(line); free(tokens);
+            free(line);
             
             if (n == -1) { 
                 puts("cshell: invalid syntax\n");
@@ -55,8 +55,12 @@ int main() {
         Command *cmd = NULL;
         int isValid = run_parser(tokens, n, &cmd);
 
+        // tokens no longer needed
+        free_tokens(tokens, n);
+
         if (isValid != 0) {              // invalid grammer or out of memory 
-            free(line); free(tokens);
+            // run_parser frees any partial chain implicitly
+            free(line);
             
             if (isValid == 1) {
                 puts("cshell: invalid syntax\n");
@@ -65,9 +69,18 @@ int main() {
             fprintf(stderr, "cshell: out of memory\n");
             exit(1);
         }
-        // input is valid as per grammar, pass to exec 
-        // execute(cmd); 
-         
+        printf("valid grammer\n");
+        /*while (cmd)
+        {
+            for(int i=0; i < cmd->argc; i++)
+                printf(cmd->argv[i]);
+
+            cmd = cmd->next;
+        }*/
+        // input is valid as per grammar, pass to exec  
+
+        free_command_chain(cmd);
+        free(line);
     }
 
     return 0;
