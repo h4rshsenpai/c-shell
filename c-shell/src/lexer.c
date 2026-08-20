@@ -42,10 +42,8 @@ ssize_t tokenize(const char* p, Token **out_tokens) {
         else                            // only possibility is WORD
             status = read_word(&tok, &p);
 
-        if (status == 1)    // invalid syntax
-            return -1;
-        if (status == 2)
-            return -2;      // malloc error in strdup
+        if (status != 0)    // 1 - invalid syntax, 2 - memory error
+            return -1*status;
 
         status = append_token(&tok, out_tokens, &count);
         if (status) 
@@ -95,6 +93,8 @@ int read_word(Token* tok, const char** p) {
 
     tok->type = WORD;
     tok->body = strdup(word);
+    if (!tok->body)
+            return 2;
     return 0;
 } 
 

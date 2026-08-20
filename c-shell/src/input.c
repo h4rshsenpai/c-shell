@@ -5,19 +5,14 @@
 #include "input.h"
 
 read_status_t read_user_input(char **out_line, size_t *out_len) {
-
     char* line = NULL;
     size_t len = 0;
     ssize_t n = getline(&line, &len, stdin);
 
     if (n < 0) {
         free(line);
-        *out_line = NULL;
-
-        if (ferror(stdin)) {
-            fprintf(stderr, "failed to read input");
+        if (ferror(stdin))
             return READ_ERROR;
-        }
         return READ_EOF;
     }
 

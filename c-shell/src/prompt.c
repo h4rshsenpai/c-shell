@@ -45,8 +45,7 @@ void shell_init(void) {
     }
 }
 
-const char* shell_get_home(void) {
-    
+const char* shell_get_home(void) {    
     // if init_home() never runs, set home to NULL
     return SHELL_HOME_DIR[0]? SHELL_HOME_DIR : NULL;
 }
@@ -89,8 +88,6 @@ void print_prompt(void) {
     char* hostname = SHELL_HOST_NAME;
     char* username = SHELL_USER_NAME;
    
-    printf("%s %s", hostname, username);
-
     char cwdir[PATH_MAX];
     if (!getcwd(cwdir, sizeof(cwdir))) {
         snprintf(cwdir, sizeof(cwdir), "/");
@@ -98,6 +95,6 @@ void print_prompt(void) {
     // resolve absolute path 
     get_cwd_relative(cwdir, sizeof(cwdir));
 
-    fprintf(stdout, "<%s@%s:%s> ", hostname, username, cwdir);
+    fprintf(stdout, "<%s@%s:%s> ", username, hostname, cwdir);
     fflush(stdout);
 }
