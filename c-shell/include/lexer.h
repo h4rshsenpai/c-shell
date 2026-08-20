@@ -24,6 +24,8 @@ typedef struct {
 
 ssize_t tokenize(const char* p, Token** out_tokens);
 
+void free_tokens(Token* tokens, size_t count);
+
 void helper_trim(const char** p);
 
 int append_token(Token* tok, Token** out_tokens, size_t* count);

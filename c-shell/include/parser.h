@@ -16,9 +16,9 @@ typedef struct Command {
     int argc;   
     
     char **ins;   
-    size_t n_ins;
+    int n_ins;
     Outfile *outs;
-    size_t n_outs;
+    int n_outs;
 
     bool isBackground;
 
@@ -28,6 +28,8 @@ typedef struct Command {
 
 
 int consume_and_next(Token tok, Command *cmd, size_t *pos);
+
+void free_command_chain(Command *cmd); 
 
 int run_parser(const Token *tokens, size_t n, Command **out_cmd);
 
