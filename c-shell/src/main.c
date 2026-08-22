@@ -6,6 +6,7 @@
 #include "input.h"
 #include "lexer.h"
 #include "parser.h"
+#include "exec.h"
 
 int main() {
 
@@ -31,7 +32,7 @@ int main() {
         // status == READ_OK, line is valid
         if (len == 0) { free(line); continue; } // empty input is valid
 
-        // pass input to lexer
+        // A3. lexer validates input
         Token* tokens; 
         ssize_t n = tokenize(line, &tokens);
         
@@ -47,10 +48,8 @@ int main() {
         } 
         // syntax valid, n holds number of tokens retrieved
         
-        // A3. pass to parser
-        
-        for (int i=0; i<n; i++) 
-            printf("%d %s\n", tokens[i].type, tokens[i].body);
+
+        // A3. parser builds the command chain 
         
         Command *cmd = NULL;
         int isValid = run_parser(tokens, n, &cmd);
@@ -70,9 +69,9 @@ int main() {
             exit(1);
         }
         // input is valid as per grammar, pass to exec  
-        run_cmd(cmd);
+        execute_command_group(cmd);
 
-        free_command_chain(cmd);
+        free_command_group(cmd);
         free(line);
     }
 

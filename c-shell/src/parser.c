@@ -38,29 +38,28 @@ int consume_and_next(Token tok, Command *cmd, size_t* pos) {
     return 0;
 }
 
-void free_command_chain(Command *cmd) {
-    while (cmd) {
-        Command *next = cmd->next;
+void free_command_group(Command *head) {
+    while (head) {
+        Command *next = head->next;
         
-        for (int i = 0; i < cmd->argc; i++)
-            free(cmd->argv[i]);
-        free(cmd->argv);
+        for (int i = 0; i < head->argc; i++)
+            free(head->argv[i]);
+        free(head->argv);
         
-        for (int i = 0; i < cmd->n_ins; i++)
-            free(cmd->ins[i]);
-        free(cmd->ins);
+        for (int i = 0; i < head->n_ins; i++)
+            free(head->ins[i]);
+        free(head->ins);
         
-        for (int i = 0; i < cmd->n_outs; i++)
-            free(cmd->outs[i].path);
-        free(cmd->outs);
+        for (int i = 0; i < head->n_outs; i++)
+            free(head->outs[i].path);
+        free(head->outs);
 
-        free(cmd);
-        cmd = next;
+        free(head);
+        head = next;
     }
 }
 
 int run_parser(const Token *tokens, size_t n, Command **out_cmd) {
-   
     if (n == 0) 
         return 0; // empty input valid
     
@@ -80,7 +79,7 @@ int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd) {
     
     // 1. consume WORD
     if (consume_and_next(tokens[*pos], next_cmd, pos)) { 
-        free_command_chain(next_cmd);
+        free_command_group(next_cmd);
         *out_cmd = NULL;
         return 2; 
     }
@@ -93,7 +92,7 @@ int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd) {
     if (status != 0) {
         // free this node and anything parse_arg linked below it
         // deeper nodes that failed are expected to be freed by their own parse_cmd
-        free_command_chain(next_cmd);
+        free_command_group(next_cmd);
         return status;
     }
     return 0;

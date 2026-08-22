@@ -29,7 +29,7 @@ typedef struct Command {
 
 int consume_and_next(Token tok, Command *cmd, size_t *pos);
 
-void free_command_chain(Command *cmd); 
+void free_command_group(Command *head); 
 
 int run_parser(const Token *tokens, size_t n, Command **out_cmd);
 
