@@ -1,7 +1,7 @@
 # POSIX-compliant build for shell.out
 
 CC = gcc
-CFLAGS = -fsanitize=address,undefined -std=c23 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -Wall -Wextra -Werror -Wno-unused-parameter -fno-asm
+CFLAGS = -g -O0 -std=c23 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -Wall -Wextra -Werror -Wno-unused-parameter -fno-asm
 
 BUILD_DIR = build
 SRC_DIR = src
@@ -12,6 +12,7 @@ SRCS = $(SRC_DIR)/main.c \
 	   $(SRC_DIR)/input.c \
 	   $(SRC_DIR)/lexer.c \
 	   $(SRC_DIR)/parser.c \
+	   $(SRC_DIR)/exec.c \
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
@@ -34,4 +35,3 @@ $(BUILD_DIR):
 
 clean:
 	rm -rf $(BUILD_DIR) shell.out
-
