@@ -109,8 +109,10 @@ int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
     switch(tokens[*pos].type) {
 
         case WORD:
-            if (consume_and_next(tokens[*pos], cmd, pos))
-                return 2;
+            while (*pos < n && tokens[*pos].type == WORD) // WORD can recurse into WORD so while loop optimizes
+                //                                       // recursion depth to O(no of command) instead of O(no of tokens)
+                if (consume_and_next(tokens[*pos], cmd, pos))
+                    return 2;
             return parse_arg(tokens, n, pos, cmd);
 
         case OP_LT:

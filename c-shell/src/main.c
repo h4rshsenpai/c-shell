@@ -69,15 +69,8 @@ int main() {
             fprintf(stderr, "cshell: out of memory\n");
             exit(1);
         }
-        printf("valid grammer\n");
-        /*while (cmd)
-        {
-            for(int i=0; i < cmd->argc; i++)
-                printf(cmd->argv[i]);
-
-            cmd = cmd->next;
-        }*/
         // input is valid as per grammar, pass to exec  
+        run_cmd(cmd);
 
         free_command_chain(cmd);
         free(line);
