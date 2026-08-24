@@ -6,240 +6,253 @@
 #include "lexer.h"
 #include "parser.h"
 
-static int consume_and_next(Token tok, Command *cmd, size_t* pos);
-static void apply_background_to_group(Command *cmd);
-static int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd);
-static int parse_arg(const Token *tokens, size_t n, size_t *pos, Command **out_cmd);
-static int parse_bg(const Token *tokens, size_t n, size_t *pos, Command **out_cmd)
-static int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command **out_cmd)
+static int parse_pipeline(ParserState *state, Pipeline *out_pipeline);
+static int parse_single_command(ParserState *state, SimpleCommand *out_cmd);
+static int parse_command_suffix(ParserState *state, SimpleCommand *cmd);
+static int append_pipeline(CommandLine *line, Pipeline *pipeline);
+static int append_stage(Pipeline *pipeline, SimpleCommand *cmd);
+static int append_word(char ***items, int *n, char *body);
+static int append_tgt(TokenType op, SimpleCommand* cmd, char *body);
 
+static void free_single_command(SimpleCommand *cmd) {
+    if (!cmd) return;
 
-/* typedef struct Command {
-    char **argv;
-    int argc;
-    char **ins;
-    int n_ins;
-    Outfile *outs;
-    int n_outs;
-    bool isBackground;
-    struct Command *next;
-    char connector;         
-*/
+    for (int i = 0; i < cmd->argc; i++) free(cmd->argv[i]);
+    free(cmd->argv); cmd->argv = NULL;
 
-void free_command_group(Command *head) {
-    while (head) {
-        Command *next = head->next;
-        
-        for (int i = 0; i < head->argc; i++) free(head->argv[i]);
-        free(head->argv);
-        
-        for (int i = 0; i < head->n_ins; i++) free(head->ins[i]);
-        free(head->ins);
-        
-        for (int i = 0; i < head->n_outs; i++) free(head->outs[i].path);
-        free(head->outs);
+    for (int i = 0; i < cmd->n_ins; i++) free(cmd->ins[i]);
+    free(cmd->ins); cmd->ins = NULL;
 
-        free(head);
-        head = next;
-    }
+    for (int i = 0; i < cmd->n_outs; i++) free(cmd->outs[i].path);
+    free(cmd->outs); cmd->outs = NULL;
+
+    // zero out heap allocated cmd for sanity 
+    memset(cmd, 0, sizeof(*cmd));
 }
 
-int run_parser(const Token *tokens, size_t n, Command **out_cmd) {
-    if (n == 0) 
-        return 0; // empty input valid
-    
-    int status;
-    size_t pos = 0;
-    status = parse_cmd(tokens, n, &pos, out_cmd);
-    
-    // "ls -l | wc > file.txt &"  -- '&' applies to the entire command not just wc 
-    if (status == 0)
-        apply_background_to_group(*out_cmd); // push isBackground up the chain
-    return status;
+static void free_pipeline(Pipeline *pipeline) {
+    if (!pipeline) return;
+
+    for (int i = 0; i < pipeline->count; i++) 
+        free_single_command(&pipeline->stages[i]);
+
+    free(pipeline->stages);
+    // zero out heap allocated pipeline 
+    memset(pipeline, 0, sizeof(*pipeline));
 }
 
-static int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd) {
-        
-    if (*pos >= n || tokens[*pos].type != WORD)  
-        return 1; 
- 
-    Command *next_cmd = (Command *)calloc(1, sizeof(Command));
-    if (!next_cmd) 
-        return 2;  
+void free_command_line(CommandLine *line) {
+    if (!line) return; 
+
+    for (int i = 0; i < line->count; i++) 
+        free_pipeline(&line->pipelines[i]);
+
+    free(line->pipelines); line->pipelines = NULL;
+    free(line); line = NULL;
+}
+
+int run_parser(const Token *tokens, size_t n, CommandLine **out_line) {
     
-    // 1. consume WORD
-        // if consume fails (malloc error), free the entire chain 
-    if (consume_and_next(tokens[*pos], next_cmd, pos)) { 
-        
-        // if consume fails, free the entire chain built uptil now
-        free_command_group(next_cmd);
-        *out_cmd = NULL;
-        return 2; 
-    }
+    CommandLine *line = NULL; *out_line = NULL;
+    ParserState state = {tokens, n, 0};
+    
+    if (n == 0) return 0; // empty input is valid
+    
+    line = calloc(1, sizeof(*line));
+    if (!line) return 2;
+    
+    while (state.pos < state.count) {
+        Pipeline pipeline = {0};
+        TokenType separator; 
 
-    // 2. add command to chain, node links are handled by parse_arg
-    *out_cmd = next_cmd; 
+        int status = parse_pipeline(&state, &pipeline);
+        if (status) {
+            // invalid grammer or malloc error
+            free_pipeline(&pipeline); free_command_line(line);
+            return status;
+        }
 
-    // 3. parse ARG
-    int status = parse_arg(tokens, n, pos, next_cmd);
-    if (status != 0) {
-        // free this node and anything parse_arg linked below it
-        // deeper nodes that failed are expected to be freed by their own parse_cmd
-        free_command_group(next_cmd);
-        return status;
-    }
+        if(state.pos < state.count && state.tokens[state.pos].type == OP_AMP) {
+            pipeline.isBackground = true;
+            separator = OP_AMP;
+            state.pos++;
+        } 
+        else if(state.pos < state.count && state.tokens[state.pos].type == OP_SEMI) {
+            separator = OP_SEMI;
+            state.pos++;
+        }
+        else { separator = NA;}
+
+    
+        // parser checks for trailing ; or & at end of input
+        // if present, returns with error immediately and pipeline is not appended
+        if (state.pos >= state.count && separator != NA) {
+            free_pipeline(&pipeline);
+            free_command_line(line);
+            return 1; 
+        }
+        if(append_pipeline(line, &pipeline) != 0) {
+            free_pipeline(&pipeline);
+            free_command_line(line);
+            return 2;
+        }
+    }    
+
+    // grammer valid -> pass parsed input to main for execution
+    *out_line = line;
     return 0;
 }
 
-static int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
+static int parse_pipeline(ParserState *state, Pipeline *out_pipeline) {
     
-    if (*pos >= n)
-        return 0; // ε case - nothing follows
+    while (1) {
+        // parse CMD at every stage 
+        SimpleCommand stage = {0};
 
-    int status;
-    Command *next_cmd = NULL; // only meaningful if complex command
-    switch(tokens[*pos].type) {
-
-        case WORD:
-            while (*pos < n && tokens[*pos].type == WORD) // WORD can recurse into WORD so while loop optimizes
-                //                                       // recursion depth to O(no of command) instead of O(no of tokens)
-                if (consume_and_next(tokens[*pos], cmd, pos))
-                    return 2;
-            return parse_arg(tokens, n, pos, cmd);
-
-        case OP_LT:
-        case OP_GT:
-        case OP_GTGT:
-            return parse_tgt(tokens, n, pos, cmd);
+        int status = parse_single_command(state, &stage);
+        if (status) {
+            free_single_command(&stage);
+            return status;
+        }
         
-        case OP_PIPE:
-            (*pos)++; // consume '|' 
-            
-            cmd->connector = '|';
-            
-            status = parse_cmd(tokens, n, pos, &next_cmd);
-            if (status) 
-                return status;
-            
-            cmd->next = next_cmd;
-            return 0;
+        // append parsed CMD to pipeline
+        if (append_stage(out_pipeline, &stage) != 0) {
+            free_single_command(&stage);
+            return 2;
+        }
 
-        case OP_SEMI:
-            (*pos)++; // consume ';' 
-            
-            cmd->connector = ';';
+        // end pipeline if EOF or next connector is not '|'
+        if (state->pos >= state->count || state->tokens[state->pos].type != OP_PIPE)
+            return 0;   
 
-            // Command *next_cmd = NULL;
-            status = parse_cmd(tokens, n, pos, &next_cmd);
-            if (status) 
-                return status;
-            
-            cmd->next = next_cmd;
-            return 0;
-        
-        case OP_AMP:
-            (*pos)++; // consume '&'
-            return parse_bg(tokens, n, pos, cmd);
-        
-        default:
+        state->pos++;
+
+        // invalid grammer if parser reaches leaf and 
+        if (state->pos >= state->count)
             return 1;
     }
 }
 
-static int parse_bg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
-
-    if (*pos >= n) {        // ε case - nothing follows
-        cmd->next = NULL;
-        return 0;
-    }  
-    
-    // WORD ARG case -> new command
-    Command *next_cmd;
-    int status = parse_cmd(tokens, n, pos, &next_cmd);
-    if (status)
-        return status;
-    
-    cmd->connector = '&';
-    cmd->next = next_cmd;
-    return 0;
-}
-
-static int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
-    TokenType op = tokens[*pos].type;
-    (*pos)++;   // consume <, >, or >>
-    
-    if (*pos >= n || tokens[*pos].type != WORD)
+// CMD --> WORD ARG 
+static int parse_single_command(ParserState *state, SimpleCommand *out_cmd) {
+    // expects WORD
+    if (state->pos >= state->count || state->tokens[state->pos].type != WORD)
         return 1;
 
-    // copy WORD - filename/path for redirection
-    char *copy = strdup(tokens[*pos].body); 
-    if (!copy) 
-        return 2;
+    char *word = strdup(state->tokens[state->pos].body);
+    if (!word) return 2;
 
-    if (op == OP_LT) {
-        char **temp = realloc(cmd->ins, (cmd->n_ins + 2) * sizeof(char*));  // **ins must be NULL terminated 
-        if (!temp) return 2;
-
-        cmd->ins = temp;
-        cmd->ins[cmd->n_ins] = copy;
-        cmd->n_ins++;
-        cmd->ins[cmd->n_ins] = NULL;
-    }
-    else {
-        Outfile *temp = realloc(cmd->outs, (cmd->n_outs + 2) * sizeof(Outfile));
-        if (!temp) return 2;
-        
-        cmd->outs = temp;
-
-        cmd->outs[cmd->n_outs].path = copy;
-        cmd->outs[cmd->n_outs].append = (op == OP_GTGT);
-        
-        cmd->n_outs++; 
-        cmd->outs[cmd->n_outs].path = NULL;
-    }
-
-    ++(*pos);       // consume target WORD
-
-    return parse_arg(tokens, n, pos, cmd);
+    if(append_word(&out_cmd->argv, &out_cmd->argc, word)) { free(word); return 2;}
+    
+    state->pos++;
+    return parse_command_suffix(state, out_cmd);
 }
 
-static int consume_and_next(Token tok, Command *cmd, size_t* pos) {
-    
-    char **temp = realloc(cmd->argv, (cmd->argc + 2) * sizeof(char*));  // one for token, one for NULL
-    if (!temp) return 2;
-    cmd->argv = temp; 
+// ARG --> 
+static int parse_command_suffix(ParserState *state, SimpleCommand *cmd) {
+   
+    // keep consuming WORD recursively until redirection operators 
+    while (state->pos < state->count) {
+        Token cur = state->tokens[state->pos];
+        char *copy = NULL;
 
-    char *copy = strdup(tok.body);
-    if (!copy) return 2;
-    
-    cmd->argv[cmd->argc] = copy; 
-    cmd->argc++;
-    cmd->argv[cmd->argc] = NULL;
-    (*pos)++;
-    
+        // ARG --> WORD ARG
+        if(cur.type == WORD) {
+            copy = strdup(cur.body); if (!copy) return 2;
+            
+            if (append_word(&cmd->argv, &cmd->argc, copy)) { free(copy); return 2; }
+            
+            state->pos++;
+            continue;
+        }
+        
+        if(cur.type == OP_LT || cur.type == OP_GT || cur.type == OP_GTGT) {
+
+            // TGT expected, return with error if nothing
+            if ((state->pos + 1) >= state->count || state->tokens[state->pos+1].type != WORD)
+                return 1;
+            
+            copy = strdup(state->tokens[state->pos + 1].body); if (!copy) return 2;
+            
+            if (append_tgt(cur.type, cmd, copy) != 0) {
+                    free(copy);
+                    return 2;
+            }
+            
+            state->pos += 2;
+            continue;
+        }
+        break;
+    }
     return 0;
 }
 
-static void apply_background_to_group(Command *cmd) {
-    Command *group_head = cmd;
+static int append_pipeline(CommandLine *line, Pipeline *pipeline) {
+    Pipeline *tmp = realloc(line->pipelines, (size_t)(line->count + 1) * sizeof(*line->pipelines));
+    if (!tmp)
+        return 1;
 
-    while (cmd) {
-        if (cmd->connector == '&') {
-            Command *current = group_head;
+    line->pipelines = tmp;
+    line->pipelines[line->count] = *pipeline;
+    line->count++;
 
-            while (current) {
-                current->isBackground = true;
+    // zero out pipeline to prevent double free 
+    memset(pipeline, 0, sizeof(*pipeline));
+    return 0;
+}
 
-                if (current == cmd)
-                    break;
-                current = current->next;
-            }
 
-            group_head = cmd->next;
-        }
-        else if (cmd->connector == ';')
-            group_head = cmd->next;
+static int append_stage(Pipeline *pipeline, SimpleCommand *cmd) {
+    SimpleCommand *tmp = realloc(pipeline->stages, (size_t)(pipeline->count + 1) * sizeof(*pipeline->stages));
+    if (!tmp)
+        return 1;
 
-        cmd = cmd->next;
+    pipeline->stages = tmp;
+    pipeline->stages[pipeline->count] = *cmd;
+    pipeline->count++;
+
+    // zero out cmd to prevent double free
+    memset(cmd, 0, sizeof(*cmd));
+    return 0;
+}
+
+
+static int append_word(char ***items, int *n, char *body) {
+    
+    char **temp = realloc(*items, (size_t)(*n + 2) * sizeof(**items));  // one for token, one for NULL
+    if (!temp) return 1;
+    
+    *items = temp;
+    (*items)[*n] = body; (*n)++;
+    (*items)[*n] = NULL;
+
+    return 0;
+}
+
+static int append_tgt(TokenType op, SimpleCommand* cmd, char *body) {
+    if (op == OP_LT) {
+        char **temp = realloc(cmd->ins, (size_t)(cmd->n_ins + 2) * sizeof(*cmd->ins));
+        if (!temp) 
+            return 1;
+        
+        cmd->ins = temp;
+        cmd->ins[cmd->n_ins] = body; 
+        cmd->n_ins++;
+        cmd->ins[cmd->n_ins] = NULL; 
+        
+        return 0;
     }
+
+    // tgt is output file
+    bool isAppend = ( op == OP_GTGT);
+    Outfile *temp = realloc(cmd->outs, (size_t)(cmd->n_outs + 1) * sizeof(*cmd->outs));
+    if (!temp)         
+        return 1;
+
+
+    cmd->outs = temp;
+    cmd->outs[cmd->n_outs] = (Outfile){body, isAppend};
+    cmd->n_outs++;
+    return 0;
+
 }

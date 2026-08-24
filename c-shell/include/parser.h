@@ -8,39 +8,39 @@
 
 typedef struct {
     char *path;
-    bool append;    // true if OP_GTGT
+    bool append;
 } Outfile;
 
-typedef struct Command {
-    char **argv;             
-    int argc;   
-    
-    char **ins;   
+typedef struct {
+    char **argv;
+    int argc;
+
+    char **ins;
     int n_ins;
+
     Outfile *outs;
     int n_outs;
+} SimpleCommand;
 
+typedef struct {
+    SimpleCommand *stages;
+    int count;
     bool isBackground;
+} Pipeline;
 
-    struct Command *next;   // command after '|' or ';', or NULL
-    char connector;         // '|', ';', '\0' if no command follows
-} Command;
+typedef struct {
+    Pipeline *pipelines;
+    int count;
+} CommandLine;
 
+typedef struct {
+    const Token *tokens;
+    size_t count;
+    size_t pos;
+    
+} ParserState;
 
-int consume_and_next(Token tok, Command *cmd, size_t *pos);
-
-void free_command_group(Command *head); 
-
-int run_parser(const Token *tokens, size_t n, Command **out_cmd);
-
-int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd);
-
-int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd);
-
-int parse_bg(const Token *tokens, size_t n, size_t *pos, Command *cmd);
-
-int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command *cmd);
-
+void free_command_line(CommandLine *line);
+int run_parser(const Token *tokens, size_t n, CommandLine **out_line);
 
 #endif // PARSER_H
-
