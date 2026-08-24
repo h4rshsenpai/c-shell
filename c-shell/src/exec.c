@@ -1,472 +1,429 @@
-#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include <fcntl.h>  // pipe() requires this
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
-#include "parser.h"     // Command struct
 #include "exec.h"
-#include "builtins.h"
+#include "redir.h"  // I/O redirection handlers and helper functions for Parts C2 and C3 
 
-// POSIX allows write() to write fewer bytes than requested 
-// Helper function for worker_feed & worker_consume to handle partial writes by looping till count bytes are written
-static int write_all(int fd, const char* buffer, size_t count) {
-    
-    size_t written = 0;
-    while (written < count) {
-        ssize_t n = write(fd, buffer + written, count - written);
-        if (n < 0) {
-            perror("cshell: helper function for write failed during redirection");
-            return 1;
-        }
-        written += (size_t)n;
-    }    
-    return 0;
-}
+typedef struct {
+    int stdin_fd;
+    int stdout_fd;
+    pid_t feeder_pid;
+    pid_t consumer_pid;
+} StageIO;
 
-static void execute_pipeline(Command *head);
-static void execute_single_command(Command *cmd, int prev_fd, int next_fd, pid_t *child_pid);
+static void close_all_pipes(int (*pipes)[2], int pipe_count);
+static void close_stage_io(StageIO *io, int (*pipes)[2], int pipe_count);
 
-static int setup_redirects_input(int *pipefd, int **input_fds, const int n_files, char *const *files) {
+static void execute_pipeline(const Pipeline *pipeline);
+static int prepare_stage_io(const SimpleCommand *cmd, int pipe_in, int pipe_out, int (*pipes)[2], int pipe_count, StageIO *io);
+static pid_t spawn_stage_child(const SimpleCommand *cmd, const StageIO *io, int (*pipes)[2], int pipe_count);
+static char *resolve_path(const char *name);
 
-    if (!n_files) return 0; // do nothing if no input files
-    
-    // 1. open all files in read-only mode first, return immediately if a file doesn't exist 
-    
-    *input_fds = malloc(n_files*sizeof(int)); 
-    if (! *input_fds) {
-        perror("cshell: malloc failed during input redirection");
-        return 2;
-    }    
-
-    for (int i = 0; i < n_files; i++) {           
-        (*input_fds)[i] = open(files[i], O_RDONLY);
-
-        if ((*input_fds)[i] == -1) {     // open() failed; assignment uses one shell message for any input-open failure
-            // close already open file descriptors before returning; free malloc'd pointer 
-
-            while(i > 0) close((*input_fds)[--i]); 
-            free(*input_fds); *input_fds = NULL;                    
-            return 1; 
-        }
-    }
-
-    // 2. create a pipe that will become the command's stdin
-
-    if (pipe(pipefd) == -1) { 
-        perror("cshell: pipe() failed during input redirection"); 
-        
-        // close all file descriptors before returning; free malloc'd pointer
-        for (int i = 0; i < n_files ; i++ ) close((*input_fds)[i]); 
-        free(*input_fds); *input_fds = NULL;
-        return 2; 
-    }
-
-    return 0;
-}
-
-static int setup_redirects_output(int *pipefd, int **output_fds, const int n_files, const Outfile *files) {
-
-    if (!n_files) return 0; // do nothing if no output files
-    
-    // 1. open all files in write-only mode and append if ">>", create with rw-r-r-- permissions if it doesnt exist
-
-    *output_fds = malloc(n_files*sizeof(int)); 
-    if (! *output_fds) {
-        perror("cshell: malloc failed during output redirection");
-        return 2;
-    }
-    
-    for (int i = 0; i < n_files; i++) {  
-        int append = files[i].append ? O_APPEND : O_TRUNC;            
-        
-        (*output_fds)[i] = open(files[i].path, O_WRONLY | O_CREAT | append, 0644);  
-        
-        if ((*output_fds)[i] == -1) {   // FILE NOT WRITABLE, return immediately      
-            // close already open file descriptors before returning; free malloc'd pointer 
-
-            while (i > 0) close((*output_fds)[--i]);   
-            free(*output_fds); *output_fds = NULL;
-
-            return 1;  
-        }
-    }
-
-    // 2. create Command -->|--|--> Consumer pipe 
-    
-    if (pipe(pipefd) == -1) { 
-        perror("cshell: pipe() failed for output redirection"); 
-        
-        for (int i = 0; i < n_files; i++) close((*output_fds)[i]);
-        free(*output_fds); *output_fds = NULL;
-        return 2; 
-    }
-
-    return 0;
-}
-
-static void worker_feed(int *input_fds, int n_ins, int pipe_write_fd) {
-    char buf[4096]; 
-    ssize_t n;
-    
-    // for each input file, read from it
-    for (int i = 0; i < n_ins; i++) {
-        //for each chunk read, write the entire chunk to pipe before reading from next input file 
-        // stop immediately if write to pipe fails
-        while((n = read(input_fds[i], buf, sizeof(buf))) > 0)
-            if (write_all(pipe_write_fd, buf, n)) {
-                    
-                close(pipe_write_fd); close(input_fds[i]); 
-                _exit(1);
-            }
-    
-        close(input_fds[i]);
-    }
-    
-    close(pipe_write_fd);
-    free(input_fds);
-    _exit(0);
-}
-
-static void worker_consume(int *output_fds, int n_outs, int pipe_read_fd) {
-    char buf[4096];
-    ssize_t n;
-
-    // read from pipe
-    while((n = read(pipe_read_fd, buf, sizeof(buf))) > 0) { 
-        // for each chunk read, write to all output files
-        // stop immediatelyif write to pipe fails
-        for (int i = 0; i < n_outs; i++)
-            if(write_all(output_fds[i], buf, n)) {
-                
-                close(pipe_read_fd);
-                for (i = 0; i < n_outs; i++) close(output_fds[i]);
-                _exit(1);
-            }
-    }
-    close(pipe_read_fd);
-
-    for (int i = 0; i < n_outs; i++) 
-        close(output_fds[i]);
-    
-    _exit(0);
-}
-
-// returns a heap-allocated executable path
-// caller always frees a non-NULL return
-static char* resolve_path(const char *name) {
-    
-    bool pathenv_only = name[0] == '%'; // skips directory check
-        
-    // --> 1. search in directory for file path or executable 
-    if (!pathenv_only) {
-        
-        // slash means a literal path
-        if (strchr(name, '/') != NULL) 
-            return (access(name, X_OK) == 0) ? strdup(name) : NULL;
-        
-        // must be an executable, check in cwd first
-        size_t len = strlen(name) + 3;
-        char *try_cwd = malloc(len);
-        
-        if (!try_cwd) {
-            perror("cshell: malloc failure");
-            return NULL;
-        }
-        snprintf(try_cwd, len, "./%s", name);
-        
-        if (access(try_cwd, X_OK) == 0) 
-            return try_cwd;
-    
-        free(try_cwd);
-    }
-
-    // --> 2. command not found in cwd so check PATH
-    if (pathenv_only) name++; 
-
-    const char *path = getenv("PATH");
-    if (!path) {
-        perror("cshell: getenv() failed to access _PATH_");
-        return NULL;
-    }
-
-    char *path_copy = strdup(path);  // dangerous to use getenv() return pointer directly
-    if (!path_copy) {
-        perror("cshell: strdup failed before _PATH_ was ever accessed");
-        return NULL;
-    } 
-
-    // split PATH into directories, check for command name
-    char *dir = strtok(path_copy, ":"); 
-    while (dir != NULL) {
-
-        size_t len = strlen(dir) + 2 + strlen(name);
-        char *try_path = malloc(len);
-        
-        if (!try_path) {
-            perror("cshell: malloc failed while traversing _PATH_");
-            
-            free(path_copy); 
-            return NULL;
-        }
-        snprintf(try_path, len, "%s/%s", dir, name);
-       
-        if (access(try_path, X_OK) == 0) {   // match found !!
-            free(path_copy);
-            return try_path;
-        }
-        free(try_path);
-        
-        dir = strtok(NULL, ":");
-    }
-    free(path_copy);
-    
-    return NULL;
-}
-
-void execute_command_group(Command *cmd) {
+void execute_command(const CommandLine *cmd) {
     if (!cmd) return;
-      
-    if (cmd->connector == '|') {
-        execute_pipeline(cmd);
+
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}  // non-blocking cleanup for already finished background children
+
+    for (int i = 0; i < cmd->count; i++)
+        execute_pipeline(&cmd->pipelines[i]);
+
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+}
+
+static void execute_pipeline(const Pipeline *pipeline) {
+
+    /*
+        Runs pipeline in stages and tracks command children 
+        plus any helper children created for I/O redirection.
+    
+        --> For each stage
+            - start from the pipeline pipe ends inherited from neighbors
+            - replace stdin with a feeder pipe when input redirection exists
+            - replace stdout with a consumer pipe when output redirection exists
+            - If setup fails for a stage, stop building the rest of the pipeline.
+
+    */
+    if (!pipeline || pipeline->count == 0)  return;
+
+    int pipe_count = pipeline->count - 1;
+    int (*pipes)[2] = NULL;
+
+    if (pipe_count > 0) {
+        pipes = malloc((size_t)pipe_count * sizeof(*pipes));
+        if (!pipes) return;
+
+        for (int i = 0; i < pipe_count; i++) {
+            pipes[i][0] = -1; pipes[i][1] = -1;
+            
+            if (pipe(pipes[i]) == -1) {
+                perror("cshell: pipe failed while executing command");
+                
+                close_all_pipes(pipes, i);  // reusable helper function for cleanup
+                free(pipes);
+                return;
+            }
+        }
+    }
+
+    pid_t *command_pids = NULL;
+    pid_t *helper_pids = NULL;
+
+    command_pids = calloc((size_t)pipeline->count, sizeof(*command_pids));
+    helper_pids = calloc((size_t)pipeline->count * 2, sizeof(*helper_pids));
+    if (!command_pids || !helper_pids) {
+        
+        free(command_pids); free(helper_pids);
+        close_all_pipes(pipes, pipe_count);
+        free(pipes);
         return;
     }
     
-    pid_t child_pid;
-    execute_single_command(cmd, -1, -1, &child_pid);
-    
-    if (child_pid > 0)
-        waitpid(child_pid, NULL, 0);
-}
+    int command_count = 0;
+    int helper_count = 0;
 
-static void execute_pipeline(Command *head) {
-    Command *cur;
-    int count = 0;
-    
-    for (cur = head; cur != NULL; cur = cur->next) {
-        count++;
-        if (cur->connector != '|')
+    // run pipeline in stages
+    for (int i = 0; i < pipeline->count; i++) {
+        StageIO io;
+        io.stdin_fd = -1; io.stdout_fd = -1; 
+        io.feeder_pid = -1, io.consumer_pid = -1;
+        
+        int pipe_in = (i == 0) ? -1 : pipes[i - 1][0];
+        int pipe_out = (i == pipeline->count - 1) ? -1 : pipes[i][1];
+
+        // set stdin and stdout for child process before forking
+        int setup_status = prepare_stage_io(&pipeline->stages[i], pipe_in, pipe_out, pipes, pipe_count, &io);
+        
+        if (io.feeder_pid > 0) helper_pids[helper_count++] = io.feeder_pid;
+        if (io.consumer_pid > 0) helper_pids[helper_count++] = io.consumer_pid;
+
+        if (setup_status) {
+            close_stage_io(&io, pipes, pipe_count);
             break;
-    }
-        
-    pid_t *pids = malloc((size_t)count * sizeof(pid_t));
-    if (!pids) {
-        perror("cshell: malloc failed during pipeline execution");
-        return;
-    }
+        }
     
-    // pipeline logic
+        // run command at current stage 
+        pid_t pid = spawn_stage_child(&pipeline->stages[i], &io, pipes, pipe_count);
+        
+        if (pid > 0) {
+            // track child's pid   
+            command_pids[command_count++] = pid;
+        } else if (pid < 0) {
+            perror("cshell: fork into command failed");
+            close_stage_io(&io, pipes, pipe_count);
+            break;
+        }
+
+        // close setup fds for stage before moving to next 
+        close_stage_io(&io, pipes, pipe_count); 
+    }
+
+    close_all_pipes(pipes, pipe_count);
+
+    // wait for all stages to finish if foreground process
+    if (pipeline->isBackground == false) {
+        for (int i = 0; i < command_count; i++) {
+            waitpid(command_pids[i], NULL, 0);
+        }
+        for (int i = 0; i < helper_count; i++) {
+            waitpid(helper_pids[i], NULL, 0);
+        }
+    }
+
+    free(command_pids);
+    free(helper_pids);
+    free(pipes);
 }
 
-static void execute_single_command(Command* cmd, int prev_fd, int next_fd, pid_t *child_pid) {
-    int *input_fds = NULL, *output_fds = NULL;  // for input and output files of command 
-    
-    int stdin_fd = prev_fd;   // standard input for command; starts with read end of pipe made by pipeline
-    int stdout_fd = next_fd; // input and output fd for command; starts with fd's passed by pipeline 
-    
-    int feeder_pipe[2] = {-1, -1}, consumer_pipe[2] = {-1, -1};          
-    pid_t feeder_pid = -1, consumer_pid = -1;
+static int prepare_stage_io(const SimpleCommand *cmd, int pipe_in, int pipe_out, int (*pipes)[2], int pipe_count, StageIO *io) {
+    /* 
+        setup effective stdin/stdout for this stage
+        --> start with pipes passed by caller, redirect to input and output files (if any)
+            --> if input redirection exists, open all input files and spawn a feeder helper to write combined contents into a pipe
+            --> if output redirection exists, open all output files and spawn a consumer helper to copy command output into all targets
+        --> return final fds through shared StageIO structure
+    */
 
-    /* ------ C2: Input Redirection
+    io->stdin_fd = pipe_in;
+    io->stdout_fd = pipe_out;
+    io->feeder_pid = -1;
+    io->consumer_pid = -1;
 
-        1. Open every input; if not found, handle error appropriately and return to caller 
-        2. Setup Feeder -->| |--> Command pipe 
-        3. Fork into Feeder, run helper function
-            -> helper is responsible for closing file descriptors and freeing heap memory in case of error 
-    */ 
+    if (cmd->n_ins > 0) {
+        int *input_fds = malloc((size_t)cmd->n_ins * sizeof(*input_fds));
+        if (!input_fds) return 2;
 
-    if (cmd->n_ins > 0) {  
-        if (setup_redirects_input(feeder_pipe, &input_fds, cmd->n_ins, cmd->ins)) { 
-            puts("cshell: no such file or directory");
+        for (int i = 0; i < cmd->n_ins; i++) {
+            input_fds[i] = open(cmd->ins[i], O_RDONLY);
             
-            *child_pid = -1;
-            return; //  command never executed 
-        }
+            if (input_fds[i] == -1) {
+                puts("cshell: no such file or directory");    
+                
+                for (int j = 0; j < i; j++)
+                    close(input_fds[j]);
 
-        feeder_pid = fork(); 
-        if (feeder_pid == 0) { 
-        // FEEDER child
-            // Reads input files in order and writes the combined stream to feeder_pipe[1].
-            close(feeder_pipe[0]); 
-            if (prev_fd != -1) close(prev_fd); 
-            if (next_fd != -1) close(next_fd);
-            worker_feed(input_fds, cmd->n_ins, feeder_pipe[1]); 
-        
-        } if (feeder_pid < 0) {
-            // fork failed
-                // --> close feeder_pipe; close all open input files; free heap allocated memory
-                // --> raise error and return to caller
-            
-            perror("cshell: fork failed");
-            for (int i = 0; i < cmd->n_ins; i++) close(input_fds[i]);
-            close(feeder_pipe[0]); close(feeder_pipe[1]);
-            free(input_fds); input_fds = NULL;
-            *child_pid = -1;
-            return; 
-        }
-
-        // parent keeps the read end; command stdin now comes from feeder_pipe[0]
-        close(feeder_pipe[1]);
-        feeder_pipe[1] = -1;
-        stdin_fd = feeder_pipe[0];
-    }
-    if (cmd->n_outs > 0) {
-        if(setup_redirects_output(consumer_pipe, &output_fds, cmd->n_outs, cmd->outs)) { 
-            puts("cshell: unable to create file for writing");
-            
-            if (stdin_fd != prev_fd && stdin_fd != -1) {
-                close(stdin_fd);
-                stdin_fd = -1;
-            }
-            if (feeder_pipe[0] != -1) {
-                close(feeder_pipe[0]);
-                feeder_pipe[0] = -1;
-            }
-            if (input_fds) {
-                for (int i = 0; i < cmd->n_ins; i++) close(input_fds[i]);
                 free(input_fds);
-                input_fds = NULL;
+                return 1;
             }
-            if (feeder_pid > 0) waitpid(feeder_pid, NULL, 0);
-            
-            *child_pid = -1;
-            return;
         }
         
-        consumer_pid = fork(); 
-        if (consumer_pid == 0) {
-        // CONSUMER CHILD
-            // Reads the command's output from consumer_pipe[0] and copies it to every output file.
+        int feeder_pipe[2];
+        if (pipe(feeder_pipe) == -1) {
+            perror("cshell: feeder pipe failed");
+            for (int i = 0; i < cmd->n_ins; i++) 
+                close(input_fds[i]);
+            free(input_fds);
+            return 2;
+        }
+
+        // fork into feeder child here 
+            // call worker_feed to open all input files, read from all and write to command
+
+        io->feeder_pid = fork();
+        if (io->feeder_pid == 0) {               
+            
+            close(feeder_pipe[0]);
+            close_all_pipes(pipes, pipe_count);
+            if (pipe_in != -1) close(pipe_in);
+            if (pipe_out != -1) close(pipe_out);
+        
+            worker_feed(input_fds, cmd->n_ins, feeder_pipe[1]);
+        
+        } if (io->feeder_pid < 0) {
+            perror("cshell: fork into feeder failed");
+            close(feeder_pipe[0]); close(feeder_pipe[1]);
+            for (int i = 0; i < cmd->n_ins; i++) 
+                close(input_fds[i]);
+            free(input_fds);
+            return 2;
+        }
+
+        // Shell process cleans up after feeder here
+            // close only i
+        for (int i = 0; i < cmd->n_ins; i++) 
+            close(input_fds[i]);
+        close(feeder_pipe[1]);
+        io->stdin_fd = feeder_pipe[0];
+        free(input_fds);
+    }
+
+    if (cmd->n_outs > 0) {
+        int *output_fds = malloc((size_t)cmd->n_outs * sizeof(*output_fds));
+        int consumer_pipe[2];
+
+        if (!output_fds) {
+            // cleaup i/o already setup for feeder 
+            if (io->stdin_fd == pipe_in) io->stdin_fd = -1;
+            if (io->stdout_fd == pipe_out) io->stdout_fd = -1;
+            close_stage_io(io, pipes, pipe_count);
+            return 2;
+        }
+
+        for (int i = 0; i < cmd->n_outs; i++) {
+            int append_mode = cmd->outs[i].append ? O_APPEND : O_TRUNC;
+            
+            output_fds[i] = open(cmd->outs[i].path, O_WRONLY | O_CREAT | append_mode, 0644);
+            if (output_fds[i] == -1) {
+                puts("cshell: unable to create file for writing");
+            
+                // handle cleanup 
+                for (int j = 0; j < i; j++) close(output_fds[j]);
+                free(output_fds);
+                if (io->stdin_fd == pipe_in) io->stdin_fd = -1;
+                if (io->stdout_fd == pipe_out) io->stdout_fd = -1;
+                close_stage_io(io, pipes, pipe_count);
+                return 1;
+            }
+        }
+
+        if (pipe(consumer_pipe) == -1) {
+            perror("cshell: consumer pipe failed");
+            for (int i = 0; i < cmd->n_outs; i++) close(output_fds[i]);
+            
+            if (io->stdin_fd == pipe_in) io->stdin_fd = -1;
+            if (io->stdout_fd == pipe_out) io->stdout_fd = -1;
+            close_stage_io(io, pipes, pipe_count);
+            
+            free(output_fds);
+            return 2;
+        }
+
+        io->consumer_pid = fork();
+        if (io->consumer_pid == 0) {    // CONSUMER child
 
             close(consumer_pipe[1]);
-            if (feeder_pipe[0] != -1) close(feeder_pipe[0]);
-            if (feeder_pipe[1] != -1) close(feeder_pipe[1]);
-            if (stdin_fd != -1 && stdin_fd != prev_fd) close(stdin_fd);
-            if(prev_fd != -1) close(prev_fd);
-            
+            close_all_pipes(pipes, pipe_count);
+            if (pipe_in != -1) close(pipe_in);
+            if (pipe_out != -1) close(pipe_out);
+            if (io->stdin_fd != -1) close(io->stdin_fd);
+
             worker_consume(output_fds, cmd->n_outs, consumer_pipe[0]);
-            
-        } if (consumer_pid < 0 ) { 
-            // fork into Consumer child failed
-                // --> close both ends of both pipes; close all open input/output files if any; free heap arrays
-                // --> raise error and return to main
-            
-            perror("cshell: fork into consumer process failed"); 
-            if (consumer_pipe[0] != -1) close(consumer_pipe[0]);
-            if (consumer_pipe[1] != -1) close(consumer_pipe[1]);
-            if (feeder_pipe[0] != -1) close(feeder_pipe[0]);
-            
-            if (cmd->n_ins > 0) for (int i = 0; i < cmd->n_ins; i++) close(input_fds[i]);
-            if (cmd->n_outs > 0) for (int i = 0; i < cmd->n_outs; i++) close(output_fds[i]);
-            free(input_fds); input_fds = NULL;
-            free(output_fds); output_fds = NULL;
-
-            if (stdin_fd!= -1 && stdin_fd != prev_fd) close(stdin_fd);
-            if (feeder_pid > 0) waitpid(feeder_pid, NULL, 0);
-            *child_pid = -1;
-            return; 
-        }
         
-        // parent closes its copy of read-end of consumer pipe
+        } if (io->consumer_pid < 0) {
+            perror("cshell: fork into consumer failed");
+            close(consumer_pipe[0]);
+            close(consumer_pipe[1]);
+            for (int i = 0; i < cmd->n_outs; i++) 
+                close(output_fds[i]);
+            if (io->stdin_fd == pipe_in) io->stdin_fd = -1;
+            if (io->stdout_fd == pipe_out) io->stdout_fd = -1;
+            
+            close_stage_io(io, pipes, pipe_count);
+    
+            free(output_fds);
+            return 2;
+        }
+
+        for (int i = 0; i < cmd->n_outs; i++) 
+            close(output_fds[i]);
         close(consumer_pipe[0]);
-        consumer_pipe[0] = -1;
-        stdout_fd = consumer_pipe[1];
+        io->stdout_fd = consumer_pipe[1];
+        free(output_fds);
     }
+    return 0;
+}
 
-
-    /* ----------- C1: Command Execution
-
-        1. Fork the command process
-        2. In the child, connect stdin/stdout to the chosen redirection or pipeline fds
-        3. Resolve the command path in the child and exec it
-    */         
+static void close_stage_io(StageIO *io, int (*pipes)[2], int pipe_count) {
     
-    pid_t command_pid = fork(); 
-    if (command_pid == 0) {
-    // COMMAND CHILD
-        // --> redirect input     
-        if(stdin_fd != -1  && stdin_fd != STDIN_FILENO) dup2(stdin_fd, STDIN_FILENO);
-               
-        // --> redirect output
-        if(stdout_fd != -1 && stdout_fd != STDOUT_FILENO) dup2(stdout_fd, STDOUT_FILENO);
-        
-        if (stdin_fd != -1 && stdin_fd != prev_fd) close(stdin_fd);
-        if (stdout_fd != -1 && stdout_fd != next_fd) close(stdout_fd);
-        if (prev_fd != -1) close(prev_fd);
-        if (next_fd != -1) close(next_fd);
+    if (io->stdin_fd != -1) {
+        close(io->stdin_fd);
+        for (int i = 0; i < pipe_count; i++) {
+            if (pipes[i][0] == io->stdin_fd)
+                pipes[i][0] = -1;
+            if (pipes[i][1] == io->stdin_fd)
+                pipes[i][1] = -1;
+        }
+
+        io->stdin_fd = -1;
+    } 
+    if (io->stdout_fd != -1) {
+        close(io->stdout_fd);
+        for (int i = 0; i < pipe_count; i++) {
+            if (pipes[i][0] == io->stdout_fd)
+                pipes[i][0] = -1;
+            if (pipes[i][1] == io->stdout_fd)
+                pipes[i][1] = -1;
+        }
+        io->stdout_fd = -1;
+    } 
+    return;
+}
+
+static pid_t spawn_stage_child(const SimpleCommand *cmd, const StageIO *io, int (*pipes)[2], int pipe_count) {
+    int status;
+    pid_t pid = fork();
     
-        if (cmd->n_ins > 0) {
-            if (feeder_pipe[0] != -1) close(feeder_pipe[0]);
-            if (feeder_pipe[1] != -1) close(feeder_pipe[1]);
-            for(int i = 0; i < cmd->n_ins; i++) close(input_fds[i]);
-            free(input_fds); input_fds = NULL;
+    if (pid == 0) {
+        if (io->stdin_fd != -1 && io->stdin_fd != STDIN_FILENO) {
+            status = dup2(io->stdin_fd, STDIN_FILENO); 
+            if (status == -1) _exit(1);
+
+            close(io->stdin_fd);
         }
-        if (cmd->n_outs > 0) {
-            if (consumer_pipe[0] != -1) close(consumer_pipe[0]);
-            if (consumer_pipe[1] != -1) close(consumer_pipe[1]);
-            for(int i = 0; i < cmd->n_outs; i++) close(output_fds[i]);
-            free(output_fds); output_fds = NULL;
+        if (io->stdout_fd != -1 && io->stdout_fd != STDOUT_FILENO) {
+            status = dup2(io->stdout_fd, STDOUT_FILENO); 
+            if (status == -1) _exit(1);
+            
+            close(io->stdout_fd);
         }
-        
-        char *cmd_path = resolve_path(cmd->argv[0]);        
+
+        close_all_pipes(pipes, pipe_count);
+
+        char *cmd_path = resolve_path(cmd->argv[0]);
         if (!cmd_path) {
-            printf("cshell: command not found (%s)\n", cmd->argv[0]);
+            dprintf(STDERR_FILENO, "cshell: command not found (%s)\n", cmd->argv[0]);
             _exit(127);
         }
 
         execv(cmd_path, cmd->argv);
-        
-        // execv failed 
-            // --> close Command child's copies of any open fds; free all heap allocated memory
-            // --> raise error and exit command process
-        perror("cshell: execv failed during command execution");
-        free(cmd_path); cmd_path = NULL;
-        _exit(127);
+        perror("cshell: exec failed");
+        free(cmd_path);
+        _exit(126);
+    }
 
-    } if (command_pid < 0 ) {
-        perror("cshell: fork into command process failed"); 
+    return pid;
+}
 
-        if (stdin_fd != -1 && stdin_fd != prev_fd) close(stdin_fd);
-        if (stdout_fd != -1 && stdout_fd != next_fd) close(stdout_fd);
-        if (cmd->n_ins > 0) {
-            if (feeder_pipe[0] != -1) close(feeder_pipe[0]);
-            if (feeder_pipe[1] != -1) close(feeder_pipe[1]);
-            for (int i = 0; i < cmd->n_ins; i++) close(input_fds[i]);
-            free(input_fds);
+static char *resolve_path(const char *name) {
+    bool pathenv_only = name[0] == '%';
+
+    if (pathenv_only) name++;
+
+    if (!pathenv_only) {
+        if (strchr(name, '/') != NULL) {
+            // command is a literal path -> search in cwd
+            // if executable and exits, return path else return NULL 
+            if (access(name, X_OK) == 0) 
+                return strdup(name); 
+    
+            return NULL;
         }
-        if (cmd->n_outs > 0) {
-            if (consumer_pipe[0] != -1) close(consumer_pipe[0]);
-            if (consumer_pipe[1] != -1) close(consumer_pipe[1]);
-            for (int i = 0; i < cmd->n_outs; i++) close(output_fds[i]);
-            free(output_fds);
-        }
-        if (feeder_pid > 0) waitpid(feeder_pid, NULL, 0);
-        if (consumer_pid > 0) waitpid(consumer_pid, NULL, 0);
-        
-        *child_pid = -1;
-        return;
-    }
-    
-    if (stdin_fd != -1 && stdin_fd != prev_fd) close(stdin_fd);
-    if (stdout_fd != -1 && stdout_fd != next_fd) close(stdout_fd);
-    
-    if (cmd->n_ins > 0) {
-        if (feeder_pipe[0] != -1) close(feeder_pipe[0]);
-        if (feeder_pipe[1] != -1) close(feeder_pipe[1]);
-        for(int i = 0; i < cmd->n_ins; i++) close(input_fds[i]);
-        free(input_fds); input_fds = NULL;
-    }
-    if (cmd->n_outs > 0) {
-        if (consumer_pipe[0] != -1) close(consumer_pipe[0]);
-        if (consumer_pipe[1] != -1) close(consumer_pipe[1]);
-        for(int i = 0; i < cmd->n_outs; i++) close(output_fds[i]);
-        free(output_fds); output_fds = NULL;
-    }
-    
-    *child_pid = command_pid;
 
-    if (feeder_pid > 0) waitpid(feeder_pid, NULL, 0);
-    if (consumer_pid > 0) waitpid(consumer_pid, NULL, 0);
+        // commmand is an executable -> search in cwd
+            // if exits and user has exec permissons return path to executable
+            // else skip to PATH check
+        size_t len = strlen(name) + 3;
+        char *try_cwd = malloc(len);  // 2 for "./" and 1 for '\0'
+        if (!try_cwd) return NULL;
+
+        snprintf(try_cwd, len, "./%s", name);
+        if (access(try_cwd, X_OK) == 0) 
+            return try_cwd;
+
+        free(try_cwd);
+    }
+
+    // check in PATH for executable
+    
+    const char *path = getenv("PATH");
+    if (!path) return NULL;
+
+    char *path_copy = strdup(path); // don't use pointer returned by getenv !!
+    if (!path_copy) return NULL;
+
+    char *ptr = NULL;
+    char *dir = strtok_r(path_copy, ":", &ptr); // strtok() is not thread safe
+
+    while (dir) {
+        size_t len = strlen(dir) + strlen(name) + 2;
+        char *try_path = malloc(len); // 1 for '/' and 1 for '\0'
+        if (!try_path) { free(path_copy); return NULL; }
+
+        snprintf(try_path, len, "%s/%s", dir, name);
+        
+        if (access(try_path, X_OK) == 0) {  // FOUND !!
+            free(path_copy);
+            return try_path;
+        }
+    
+        free(try_path);
+        dir = strtok_r(NULL, ":", &ptr);
+    }
+
+    // Commmand not found so return NULL --> caller prints error message
+    free(path_copy);
+    return NULL;
+}
+
+
+
+static void close_all_pipes(int (*pipes)[2], int pipe_count) {
+    for (int i = 0; i < pipe_count; i++) {
+        if (pipes[i][0] != -1) {
+            
+            close(pipes[i][0]);
+            pipes[i][0] = -1;
+        }
+        if (pipes[i][1] != -1) {
+            
+            close(pipes[i][1]);
+            pipes[i][1] = -1;
+        }
+    }
 }
