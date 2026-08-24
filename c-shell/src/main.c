@@ -10,55 +10,59 @@
 
 int main() {
 
-    shell_init();
-    
+    Token *tokens = NULL;
+    Command *cmd = NULL;
+    char *line = NULL; size_t len;
+
+    shell_init();   // initializes shell environment
+                    // sets username, hostname and HOME 
+                
     while(1) {
+        /* ---------- Part A : SHELL INPUT ------------ 
 
-        // A1. display shell prompt
+        1. Display shell prompt
+        2. Consume input from user
+        3. Parse input
+            --> Lexer tokenizes raw input and validates syntax
+            --> if valid, passes tokens to Parser
+                --> parser validates grammar + builds command representation simultaneously
+                --> parsed command is sent for execution 
+        */
+
         print_prompt();
+        read_status_t status = read_user_input(&line, &len); // removes trailing newline          
         
-        // A2. take user input
-        char *line = NULL; size_t len;
-        read_status_t status = read_user_input(&line, &len); // removes trailing newline               
-       
-        if (status == READ_ERROR) {
-            fprintf(stderr, "cshell: failed to read input");
-            return 1;
+        if (status == 1) {  // User exits via Ctrl-D    
+            puts("Logging out"); 
+            exit(0);
         }
-        if (status == READ_EOF) {   // Ctrl-D EOF 
-            puts("Logging out");
-            exit(1);
-        }
-        // status == READ_OK, line is valid
-        if (len == 0) { free(line); continue; } // empty input is valid
-
-        // A3. lexer validates input
-        Token* tokens; 
-        ssize_t n = tokenize(line, &tokens);
-        
-        if (n < 0) {                    // syntax error or out of memory
-            free(line);
-            
-            if (n == -1) { 
-                puts("cshell: invalid syntax\n");
-                continue;
-            }
-            fprintf(stderr, "cshell: out of memory\n"); 
-            exit(1); 
+        if (status == 2) {  // getline() failed --> try again?
+            fprintf(stderr, "getline failure");
+            continue;
         } 
-        // syntax valid, n holds number of tokens retrieved
         
+        // display prompt again if input is empty
+        if (len == 0) { free(line); continue; } 
 
-        // A3. parser builds the command chain 
-        
-        Command *cmd = NULL;
+        ssize_t n = tokenize(line, &tokens);
+        if (n == -1) {  
+            puts("cshell: invalid syntax\n");
+            free(line); line = NULL; 
+            
+            continue;
+
+        } if (n == -2)
+            perror("cshell: malloc failure during parsing\n"); 
+            exit(1); 
+        }
+    
+        // start an empty command chain; call parser to validate grammer and build command
+        // if any error, run_parser frees partially-built command before returning here
+            
         int isValid = run_parser(tokens, n, &cmd);
+        free_tokens(tokens, n); // no longer needed
 
-        // tokens no longer needed
-        free_tokens(tokens, n);
-
-        if (isValid != 0) {              // invalid grammer or out of memory 
-            // run_parser frees any partial chain implicitly
+        if (isValid != 0) { 
             free(line);
             
             if (isValid == 1) {
@@ -68,9 +72,9 @@ int main() {
             fprintf(stderr, "cshell: out of memory\n");
             exit(1);
         }
-        // input is valid as per grammar, pass to exec  
-        execute_command_group(cmd);
 
+        execute_command_group(cmd);
+        
         free_command_group(cmd);
         free(line);
     }

@@ -6,52 +6,37 @@
 #include "lexer.h"
 #include "parser.h"
 
-/*typedef struct Command {
-   8   ▏
-   9   ▏   char **argv;            // eg. "ls", "-la", NULL
-  10   ▏   int argc;
-  11   ▏   char *stdin_file;   // filename after '<' or NUL
-  12   ▏   char *stdout_file;  // filename after '>' or NUL
-  13   ▏
-  14   ▏   bool isBackground;      // true if followed by '&'
-  15   ▏   struct Command *next;   // command after '|' or ';',
-  16   ▏   char connector;         // '|', ';', '\0' if no comm
-  17   } Command;
-  18
-  19
+static int consume_and_next(Token tok, Command *cmd, size_t* pos);
+static void apply_background_to_group(Command *cmd);
+static int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd);
+static int parse_arg(const Token *tokens, size_t n, size_t *pos, Command **out_cmd);
+static int parse_bg(const Token *tokens, size_t n, size_t *pos, Command **out_cmd)
+static int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command **out_cmd)
+
+
+/* typedef struct Command {
+    char **argv;
+    int argc;
+    char **ins;
+    int n_ins;
+    Outfile *outs;
+    int n_outs;
+    bool isBackground;
+    struct Command *next;
+    char connector;         
 */
-
-int consume_and_next(Token tok, Command *cmd, size_t* pos) {
-    
-    char **temp = realloc(cmd->argv, (cmd->argc + 2) * sizeof(char*));  // one for token, one for NULL
-    if (!temp) return 2;
-    cmd->argv = temp; 
-
-    char *copy = strdup(tok.body);
-    if (!copy) return 2;
-    
-    cmd->argv[cmd->argc] = copy; 
-    cmd->argc++;
-    cmd->argv[cmd->argc] = NULL;
-    (*pos)++;
-    
-    return 0;
-}
 
 void free_command_group(Command *head) {
     while (head) {
         Command *next = head->next;
         
-        for (int i = 0; i < head->argc; i++)
-            free(head->argv[i]);
+        for (int i = 0; i < head->argc; i++) free(head->argv[i]);
         free(head->argv);
         
-        for (int i = 0; i < head->n_ins; i++)
-            free(head->ins[i]);
+        for (int i = 0; i < head->n_ins; i++) free(head->ins[i]);
         free(head->ins);
         
-        for (int i = 0; i < head->n_outs; i++)
-            free(head->outs[i].path);
+        for (int i = 0; i < head->n_outs; i++) free(head->outs[i].path);
         free(head->outs);
 
         free(head);
@@ -65,10 +50,15 @@ int run_parser(const Token *tokens, size_t n, Command **out_cmd) {
     
     int status;
     size_t pos = 0;
-    return status = parse_cmd(tokens, n, &pos, out_cmd);
+    status = parse_cmd(tokens, n, &pos, out_cmd);
+    
+    // "ls -l | wc > file.txt &"  -- '&' applies to the entire command not just wc 
+    if (status == 0)
+        apply_background_to_group(*out_cmd); // push isBackground up the chain
+    return status;
 }
 
-int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd) {
+static int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd) {
         
     if (*pos >= n || tokens[*pos].type != WORD)  
         return 1; 
@@ -78,7 +68,10 @@ int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd) {
         return 2;  
     
     // 1. consume WORD
+        // if consume fails (malloc error), free the entire chain 
     if (consume_and_next(tokens[*pos], next_cmd, pos)) { 
+        
+        // if consume fails, free the entire chain built uptil now
         free_command_group(next_cmd);
         *out_cmd = NULL;
         return 2; 
@@ -98,7 +91,7 @@ int parse_cmd(const Token *tokens, size_t n, size_t *pos, Command **out_cmd) {
     return 0;
 }
 
-int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
+static int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
     
     if (*pos >= n)
         return 0; // ε case - nothing follows
@@ -153,16 +146,14 @@ int parse_arg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
     }
 }
 
-int parse_bg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
-    cmd->isBackground = true;
+static int parse_bg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
 
     if (*pos >= n) {        // ε case - nothing follows
         cmd->next = NULL;
         return 0;
     }  
-   
     
-    // WORD ARG case - new command follows
+    // WORD ARG case -> new command
     Command *next_cmd;
     int status = parse_cmd(tokens, n, pos, &next_cmd);
     if (status)
@@ -173,7 +164,7 @@ int parse_bg(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
     return 0;
 }
 
-int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
+static int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
     TokenType op = tokens[*pos].type;
     (*pos)++;   // consume <, >, or >>
     
@@ -190,7 +181,6 @@ int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
         if (!temp) return 2;
 
         cmd->ins = temp;
-
         cmd->ins[cmd->n_ins] = copy;
         cmd->n_ins++;
         cmd->ins[cmd->n_ins] = NULL;
@@ -211,4 +201,45 @@ int parse_tgt(const Token *tokens, size_t n, size_t *pos, Command *cmd) {
     ++(*pos);       // consume target WORD
 
     return parse_arg(tokens, n, pos, cmd);
+}
+
+static int consume_and_next(Token tok, Command *cmd, size_t* pos) {
+    
+    char **temp = realloc(cmd->argv, (cmd->argc + 2) * sizeof(char*));  // one for token, one for NULL
+    if (!temp) return 2;
+    cmd->argv = temp; 
+
+    char *copy = strdup(tok.body);
+    if (!copy) return 2;
+    
+    cmd->argv[cmd->argc] = copy; 
+    cmd->argc++;
+    cmd->argv[cmd->argc] = NULL;
+    (*pos)++;
+    
+    return 0;
+}
+
+static void apply_background_to_group(Command *cmd) {
+    Command *group_head = cmd;
+
+    while (cmd) {
+        if (cmd->connector == '&') {
+            Command *current = group_head;
+
+            while (current) {
+                current->isBackground = true;
+
+                if (current == cmd)
+                    break;
+                current = current->next;
+            }
+
+            group_head = cmd->next;
+        }
+        else if (cmd->connector == ';')
+            group_head = cmd->next;
+
+        cmd = cmd->next;
+    }
 }
