@@ -1,7 +1,5 @@
-#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 #include "lexer.h"
 #include "parser.h"
@@ -41,7 +39,7 @@ static void free_pipeline(Pipeline *pipeline) {
     memset(pipeline, 0, sizeof(*pipeline));
 }
 
-void free_command_line(CommandLine *line) {
+void free_parsed_command(CommandLine *line) {
     if (!line) return; 
 
     for (int i = 0; i < line->count; i++) 
@@ -68,7 +66,7 @@ int run_parser(const Token *tokens, size_t n, CommandLine **out_line) {
         int status = parse_pipeline(&state, &pipeline);
         if (status) {
             // invalid grammer or malloc error
-            free_pipeline(&pipeline); free_command_line(line);
+            free_pipeline(&pipeline); free_parsed_command(line);
             return status;
         }
 
@@ -88,12 +86,12 @@ int run_parser(const Token *tokens, size_t n, CommandLine **out_line) {
         // if present, returns with error immediately and pipeline is not appended
         if (state.pos >= state.count && separator != NA) {
             free_pipeline(&pipeline);
-            free_command_line(line);
+            free_parsed_command(line);
             return 1; 
         }
         if(append_pipeline(line, &pipeline) != 0) {
             free_pipeline(&pipeline);
-            free_command_line(line);
+            free_parsed_command(line);
             return 2;
         }
     }    

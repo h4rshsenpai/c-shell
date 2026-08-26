@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -10,9 +11,12 @@ int write_all(int fd, const char *buffer, size_t count) {
     while (written < count) {
         ssize_t n = write(fd, buffer + written, count - written);
         if (n < 0) {
-            // add error detection 
+            if (errno == EINTR)
+                continue;
             return 1;
         }
+        if (n == 0)
+            return 1;
         written += (size_t)n;
     }
 
@@ -25,13 +29,26 @@ void worker_feed(int *input_fds, int n_ins, int pipe_write_fd) {
     for (int i = 0; i < n_ins; i++) {
         ssize_t n;
 
-        while ((n = read(input_fds[i], buf, sizeof(buf))) > 0) {
+        while (1) {
+            n = read(input_fds[i], buf, sizeof(buf));
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+                break;
+
             if (write_all(pipe_write_fd, buf, (size_t)n) != 0) {
                 close(input_fds[i]);
                 close(pipe_write_fd);
                 free(input_fds);
                 _exit(1);
             }
+        }
+
+        if (n < 0) {
+            close(input_fds[i]);
+            close(pipe_write_fd);
+            free(input_fds);
+            _exit(1);
         }
 
         close(input_fds[i]);
@@ -47,6 +64,8 @@ void worker_consume(int *output_fds, int n_outs, int pipe_read_fd) {
 
     while (true) {
         ssize_t n = read(pipe_read_fd, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR)
+            continue;
         if (n <= 0) {
             break;
         }

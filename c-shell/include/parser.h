@@ -40,7 +40,7 @@ typedef struct {
     
 } ParserState;
 
-void free_command_line(CommandLine *line);
+void free_parsed_command(CommandLine *line);
 int run_parser(const Token *tokens, size_t n, CommandLine **out_line);
 
 #endif // PARSER_H

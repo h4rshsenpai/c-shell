@@ -1,6 +1,9 @@
 #ifndef LEXER_H
 #define LEXER_H
 
+#include <stddef.h>
+#include <sys/types.h>
+
 extern const char *whitespace;
 extern const char *special;
 

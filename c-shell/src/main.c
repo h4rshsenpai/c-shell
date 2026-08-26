@@ -1,83 +1,91 @@
-#include <unistd.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-#include "prompt.h"
+#include "exec.h"
+#include "hop.h"
 #include "input.h"
 #include "lexer.h"
 #include "parser.h"
-#include "exec.h"
+#include "prompt.h"
 
-int main() {
-
+int main(void) {
+    char *input = NULL;
+    size_t len = 0;
     Token *tokens = NULL;
-    Command *cmd = NULL;
-    char *line = NULL; size_t len;
-
-    shell_init();   // initializes shell environment
-                    // sets username, hostname and HOME 
-                
-    while(1) {
-        /* ---------- Part A : SHELL INPUT ------------ 
-
-        1. Display shell prompt
-        2. Consume input from user
-        3. Parse input
-            --> Lexer tokenizes raw input and validates syntax
-            --> if valid, passes tokens to Parser
-                --> parser validates grammar + builds command representation simultaneously
-                --> parsed command is sent for execution 
-        */
-
-        print_prompt();
-        read_status_t status = read_user_input(&line, &len); // removes trailing newline          
-        
-        if (status == 1) {  // User exits via Ctrl-D    
-            puts("Logging out"); 
-            exit(0);
-        }
-        if (status == 2) {  // getline() failed --> try again?
-            fprintf(stderr, "getline failure");
-            continue;
-        } 
-        
-        // display prompt again if input is empty
-        if (len == 0) { free(line); continue; } 
-
-        ssize_t n = tokenize(line, &tokens);
-        if (n == -1) {  
-            puts("cshell: invalid syntax\n");
-            free(line); line = NULL; 
-            
-            continue;
-
-        } if (n == -2)
-            perror("cshell: malloc failure during parsing\n"); 
-            exit(1); 
-        }
+    CommandLine *cmd = NULL;
     
-        // start an empty command chain; call parser to validate grammer and build command
-        // if any error, run_parser frees partially-built command before returning here
-            
-        int isValid = run_parser(tokens, n, &cmd);
-        free_tokens(tokens, n); // no longer needed
+    shell_init();
+    hop_init();
 
-        if (isValid != 0) { 
-            free(line);
+    while (1) {
+        print_prompt();
+
+        int status = read_user_input(&input, &len);
+        
+        if (status == 1) {   // User pressed Ctrl+D
+            puts("Logging out");
             
-            if (isValid == 1) {
-                puts("cshell: invalid syntax\n");
-                continue;
-            } 
-            fprintf(stderr, "cshell: out of memory\n");
-            exit(1);
+            hop_shutdown();
+            free(input);    
+            return 0;
+        }
+        if (status == 2) {  // read_user_input failed
+            perror("cshell: getline failed during user input");
+            
+            free(input); input = NULL;
+            continue;
         }
 
-        execute_command_group(cmd);
-        
-        free_command_group(cmd);
-        free(line);
-    }
+        // --> if empty input, go back to shell prompt
+        if (len == 0) { 
+            free(input); input = NULL;
+            continue;
+        }
 
+        // --> pass input to lexer
+        ssize_t n_tokens = tokenize(input, &tokens);
+
+        if (n_tokens == -1) {  // invalid syntax 
+            
+            puts("cshell: invalid syntax");
+            free(input); input = NULL;
+            continue;
+        }
+        if (n_tokens == -2) {   // malloc error 
+            perror("cshell: out of memory");
+            hop_shutdown();
+            free(input); input = NULL;
+            return 1;
+        }
+
+        // --> pass tokens to parser which builds an intermediate representation for exec 
+            // free tokens since no longer needed
+        int parse_status = run_parser(tokens, (size_t)n_tokens, &cmd);
+
+        free_tokens(tokens, (size_t)n_tokens);
+        tokens = NULL;
+
+        if (parse_status == 1) {    // invalid grammar
+
+            puts("cshell: invalid syntax");
+            free(cmd); cmd = NULL;
+            continue;
+        }
+        if (parse_status == 2) {    // run_parser failed
+            perror("cshell: out of memory");
+            hop_shutdown();
+            free(cmd); cmd = NULL;
+            return 1;
+        }
+        
+        // --> grammer is valid, parser passes the command model to exec
+        execute_command(cmd);
+        free_parsed_command(cmd);
+        cmd = NULL;
+
+        free(input);
+        input = NULL;
+    }
     return 0;
 }
+    

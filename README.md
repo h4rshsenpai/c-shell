@@ -1,54 +1,106 @@
-# C Shell - Implementing my own C-shell & MLFQ scheduling policy for xv6
+# C-Shell assumptions
 
-Submission 1 - Parts A, B & C
-Due Date - 24 Aug
+## Part A: Shell Input
 
-## Part A : Shell Input -- 20 marks
+### A1 - prompt + input loop
 
-### A1: Shell Prompt -- 3 marks 
+- initialize shell state once at startup
+- print prompt
+- read one line from stdin
+- if EOF, print logout message and exit
+- if empty input, skip execution and print prompt again
 
-- Requirements
-1. Resolve absolute paths to relative from /home. Show absolute path if /home isn't ancestor
-2. Display prompt only when shell isn't running a foreground process
+### A2 - lex + parse + exec flow
 
+- tokenize raw input into shell tokens
+- reject invalid syntax early in lexer/parser
+- build a `CommandLine` containing pipelines, with each pipeline containing `SimpleCommand` stages
+- store each stage's arguments and input/output redirections separately
+- pass the parsed command model to the exec layer
+- free temporary lexer/parser allocations after every command
 
-### A2: User Input -- 2 marks
+## Part B: Shell Intrinsics
 
-- Requirements
-1. Consume input -> Display prompt again
+### B1 - hop
 
+- parse arguments from left to right
+- if no argument, hop to shell home directory
+- for each argument:
+  - `.` means stay in same directory
+  - `..` means try parent directory
+  - `~` means shell home directory
+  - `-` means previous successful directory if available
+  - otherwise treat argument like a direct relative or absolute path
+- on successful `chdir`, update previous directory
+- if a target does not resolve directly, search persistent hop history by path substring
+- rank history entries by visit frequency and last visit time
+- skip history entries whose directories no longer exist
+- load hop history when the shell starts and save it when the shell exits
+- store history in `.hop_history` under the shell's startup directory
 
-### A3: Input Parsing -- 15 marks **<--- HARDEST**
-#### Rough Flow 
+### B2 - reveal
 
-1. **Lexer pass**
-    - scan raw input, classify into token stream, apply *maximal munch* and quote/escape rules.
-    - Reject early if lexical error (see doc)
-    - Output list of tokens to parser.
+- parse only `-a` and `-t`
+- accept at most one path-like argument
+- resolve target directory using same path rules as hop, except no frecency lookup
+- open directory and read entries
+- sort entries lexicographically
+- hide dotfiles unless `-a` is set
+- if `-t` is set, recurse into subdirectories after printing directory entry
 
-2. **Parser pass**
-    - Walk the outputted token list and maintain at each point:
-        - a pointer to the head/tail for the command chain. 
-        - a current state variable (`LINE`, `ARG`, `CMD`, etc).
-        - a current command pointer the parser will fill at that state
-    - For each token, process using `switch` on (state, token_type):
-        - if type is `WORD` while in state `ARG`/`LINE`/`CMD`/`BG`, append token to tail command's 
-        argv. Change state to `ARG`. 
-        - if type is `OP_LT`/`OP_GT`/`OP_GTGT` while in `ARG`, set tail command's redirects. 
-        Transition to `TGT`. 
-        - and so on.
+### B3 - peek
 
+- parse only `-n` and `-r`
+- if no file arguments, read from stdin
+- for each argument:
+  - `-` means stdin
+  - missing path prints `peek: no such file or directory`
+  - directory prints `peek: is a directory`
+  - regular file with `-r` uses backward chunk reads with `lseek`
+  - stream input with `-r` falls back to buffering and reverse printing
+- `-n` numbers only non-empty lines
+- when multiple files are given, process them in argument order
 
-## Part B: Built-in Commands -- 40 marks
+### B4 - locate
 
-### B1: hop 
-### B2: reveal
-### B3: pee
-### B4: locate
-## Part C: File Redirection + Pipes -- 50 marks
+- reject zero arguments with `locate: invalid syntax`
+- for each command name:
+  - check current working directory first
+  - then scan every directory listed in `PATH`, in order
+  - print every executable match as an absolute path
+- if no match is found, print `locate: command not found (name)`
 
-### C1: Command Execution -- 8 marks 
-### C2: Input Redirection -- 12 marks
-### C3: Output Redirection -- 12 marks
-### C4: Command Piping -- 18 marks
+## Part C: File Redirection and Pipes
 
+### C1 - command execution
+
+- execute `hop` in the parent shell when it is a standalone foreground command so directory changes persist
+- execute `peek`, `locate`, and `reveal` in child processes
+- if command is not a builtin, resolve executable path
+- if command contains `/`, treat it like a literal executable path
+- otherwise check current directory first, then `PATH`
+- `%name` skips current-directory lookup and searches only `PATH`
+
+### C2 - input redirection
+
+- open every input file with `O_RDONLY`
+- if any file open fails, print `cshell: no such file or directory`
+- if all opens succeed, use a feeder process and private pipe to feed file contents to command stdin in listed order
+- close all opened descriptors after setup
+
+### C3 - output redirection
+
+- open every output file in its own mode
+- `>` truncates, `>>` appends
+- if any output file open fails, print `cshell: unable to create file for writing`
+- if setup succeeds, use a consumer process and private pipe to copy command stdout into every listed output target
+
+### C4 - pipes
+
+- create one pipe between every adjacent command stage
+- fork one child per stage, plus feeder/consumer helper processes for redirections when needed
+- choose each stage's effective stdin and stdout from its redirection or adjacent pipeline endpoint
+- wire the selected descriptors with `dup2`
+- redirection replaces the corresponding pipeline endpoint for that stage
+- close unused pipe ends in every parent, stage child, and helper process
+- wait for foreground command and helper processes; leave background processes running and reap finished children later
