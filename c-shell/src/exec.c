@@ -6,9 +6,12 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <signal.h>
+#include <errno.h>
 
 #include "exec.h"
 #include "hop.h"
+#include "jobs.h"
 #include "locate.h"
 #include "reveal.h"
 #include "redir.h"  // I/O redirection handlers and helper functions for Parts C2 and C3 
@@ -24,122 +27,73 @@ typedef struct {
 static void close_all_pipes(int (*pipes)[2], int pipe_count);
 static void close_stage_io(StageIO *io, int (*pipes)[2], int pipe_count);
 static char *resolve_path(const char *name);
+static int execute_command_group(const CommandGroup *pipeline);
 
-static void execute_pipeline(const Pipeline *pipeline);
-static int execute_parent_builtin(const Pipeline *pipeline);
 static int prepare_stage_io(const SimpleCommand *cmd, int pipe_in, int pipe_out, int (*pipes)[2], int pipe_count, StageIO *io);
-static pid_t spawn_stage_child(const SimpleCommand *cmd, const StageIO *io, int (*pipes)[2], int pipe_count);
 
-void execute_command(const CommandLine *cmd) {
-    if (!cmd) return;
+static bool command_is_resolvable(const SimpleCommand *cmd) {
+    if (strcmp(cmd->argv[0], "peek") == 0 ||
+        strcmp(cmd->argv[0], "locate") == 0 ||
+        strcmp(cmd->argv[0], "reveal") == 0)
+        return true;
 
-    while (waitpid(-1, NULL, WNOHANG) > 0) {}  // non-blocking cleanup for already finished background children
+    char *cmd_path = resolve_path(cmd->argv[0]);
+    if (!cmd_path)
+        return false;
 
-    for (int i = 0; i < cmd->count; i++) {
-        if (execute_parent_builtin(&cmd->pipelines[i]))
-            continue;
-        execute_pipeline(&cmd->pipelines[i]);
-    }
-
-    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+    free(cmd_path);
+    return true;
 }
 
-static int execute_parent_builtin(const Pipeline *pipeline) {
-    /*
-        Runs builtins that must execute in the shell process itself.
-
-        --> right now only hop needs this path
-            - hop changes the shell's cwd, so forking would lose the effect
-            - reuse redirection setup so builtins still work with < and >
-            - restore shell stdin/stdout once builtin finishes
-    */
-
-    if (!pipeline || pipeline->count != 1 || pipeline->isBackground)
-        return 0;
-
-    const SimpleCommand *cmd = &pipeline->stages[0];
-    if (!cmd->argv || cmd->argc == 0 || strcmp(cmd->argv[0], "hop") != 0)
-        return 0;
-
-    StageIO io;
-    io.stdin_fd = -1;
-    io.stdout_fd = -1;
-    io.feeder_pid = -1;
-    io.consumer_pid = -1;
-
-    int status = prepare_stage_io(cmd, -1, -1, NULL, 0, &io);
-    if (status) {
-        close_stage_io(&io, NULL, 0);
-        return 1;
+static void execute_command_atomic(const SimpleCommand *cmd) {
+    // Run Built
+    
+    if (strcmp(cmd->argv[0], "peek") == 0) {
+        run_peek(cmd->argc, cmd->argv);
+        fflush(NULL);
+        _exit(0);
+    }
+    if (strcmp(cmd->argv[0], "locate") == 0) {
+        run_locate(cmd->argc, cmd->argv);
+        fflush(NULL);
+        _exit(0);
+    }
+    if (strcmp(cmd->argv[0], "reveal") == 0) {
+        run_reveal(cmd->argc, cmd->argv);
+        fflush(NULL);
+        _exit(0);
     }
 
-    int old_stdin = dup(STDIN_FILENO);
-    int old_stdout = dup(STDOUT_FILENO);
-    if (old_stdin == -1 || old_stdout == -1) {
-        if (old_stdin != -1) close(old_stdin);
-        if (old_stdout != -1) close(old_stdout);
-        close_stage_io(&io, NULL, 0);
-        return 1;
+    char *cmd_path = resolve_path(cmd->argv[0]);
+    if (!cmd_path) {
+        printf("cshell: command not found (%s)\n", cmd->argv[0]);
+        _exit(127);
     }
 
-    if (io.stdin_fd != -1 && io.stdin_fd != STDIN_FILENO) {
-        if (dup2(io.stdin_fd, STDIN_FILENO) == -1) {
-            close(old_stdin);
-            close(old_stdout);
-            close_stage_io(&io, NULL, 0);
-            return 1;
-        }
-    }
-    if (io.stdout_fd != -1 && io.stdout_fd != STDOUT_FILENO) {
-        if (dup2(io.stdout_fd, STDOUT_FILENO) == -1) {
-            dup2(old_stdin, STDIN_FILENO);
-            close(old_stdin);
-            close(old_stdout);
-            close_stage_io(&io, NULL, 0);
-            return 1;
-        }
-    }
-
-    close_stage_io(&io, NULL, 0);
-
-    // run builtin in parent so cwd changes persist for later commands
-    run_hop(cmd->argc, cmd->argv);
-    fflush(NULL);
-
-    // restore shell stdio after builtin-specific redirection
-    dup2(old_stdin, STDIN_FILENO);
-    dup2(old_stdout, STDOUT_FILENO);
-    close(old_stdin);
-    close(old_stdout);
-
-    if (io.feeder_pid > 0) waitpid(io.feeder_pid, NULL, 0);
-    if (io.consumer_pid > 0) waitpid(io.consumer_pid, NULL, 0);
-    return 1;
+    execv(cmd_path, cmd->argv);
+    perror("cshell: exec failed");
+    free(cmd_path);
+    _exit(126);
 }
 
-static void execute_pipeline(const Pipeline *pipeline) {
+static int execute_command_group(const CommandGroup *cmd_group) {
 /*
-    Runs pipeline in stages and tracks command children 
+    Runs cmd_group in stages and tracks command children 
     plus any helper children created for I/O redirection.
 
     --> For each stage
-        - start from the pipeline pipe ends inherited from neighbors
+        - start from the cmd_group pipe ends inherited from neighbors
         - replace stdin with a feeder pipe when input redirection exists
         - replace stdout with a consumer pipe when output redirection exists
-        - If setup fails for a stage, stop building the rest of the pipeline.
+        - If setup fails for a stage, stop building the rest of the cmd_group.
 */
 
-    if (!pipeline || pipeline->count == 0)  
-        return;
-
-    // ------- Command I/O redirection -----------
-
-    int pipe_count = pipeline->count - 1;
+    int pipe_count = cmd_group->count - 1;
     int (*pipes)[2] = NULL;
 
     if (pipe_count > 0) {
         pipes = malloc((size_t)pipe_count * sizeof(*pipes));
-        if (!pipes) return;
+        if (!pipes) return 0;
 
         for (int i = 0; i < pipe_count; i++) {
             pipes[i][0] = -1; pipes[i][1] = -1;
@@ -149,7 +103,7 @@ static void execute_pipeline(const Pipeline *pipeline) {
                 
                 close_all_pipes(pipes, i);  // reusable helper function for cleanup
                 free(pipes);
-                return;
+                return 0;
             }
         }
     }
@@ -157,72 +111,105 @@ static void execute_pipeline(const Pipeline *pipeline) {
     pid_t *command_pids = NULL;
     pid_t *helper_pids = NULL;
 
-    command_pids = calloc((size_t)pipeline->count, sizeof(*command_pids));
-    helper_pids = calloc((size_t)pipeline->count * 2, sizeof(*helper_pids));
+    command_pids = calloc((size_t)cmd_group->count, sizeof(*command_pids));
+    helper_pids = calloc((size_t)cmd_group->count * 2, sizeof(*helper_pids));
     if (!command_pids || !helper_pids) {
         
         free(command_pids); free(helper_pids);
         close_all_pipes(pipes, pipe_count);
         free(pipes);
-        return;
+        return 0;
     }
     
     int command_count = 0;
     int helper_count = 0;
+    pid_t pgid = 0;
+    bool unresolved = false;
 
-    // run pipeline in stages
-    for (int i = 0; i < pipeline->count; i++) {
+    for (int i = 0; i < cmd_group->count; i++) {
+        SimpleCommand cmd = cmd_group->list[i];
 
-        SimpleCommand cmd = pipeline->stages[i];
+        if (!command_is_resolvable(&cmd)) {
+            printf("cshell: command not found (%s)\n", cmd.argv[0]);
+            unresolved = true;
+            break;
+        }
 
-        StageIO io;
-        io.stdin_fd = -1; io.stdout_fd = -1; 
-        io.feeder_pid = -1, io.consumer_pid = -1;
-        
         int pipe_in = (i == 0) ? -1 : pipes[i - 1][0];
-        int pipe_out = (i == pipeline->count - 1) ? -1 : pipes[i][1];
-
+        int pipe_out = (i == cmd_group->count - 1) ? -1 : pipes[i][1];
+        StageIO io = {.stdin_fd = -1, .stdout_fd = -1, .feeder_pid = -1, .consumer_pid = -1};
+    
         // set stdin and stdout for child process before forking
         int setup_status = prepare_stage_io(&cmd, pipe_in, pipe_out, pipes, pipe_count, &io);
-        
-        if (io.feeder_pid > 0) helper_pids[helper_count++] = io.feeder_pid;
-        if (io.consumer_pid > 0) helper_pids[helper_count++] = io.consumer_pid;
-
         if (setup_status) {
             close_stage_io(&io, pipes, pipe_count);
             break;
         }
+        if (io.feeder_pid > 0) helper_pids[helper_count++] = io.feeder_pid;
+        if (io.consumer_pid > 0) helper_pids[helper_count++] = io.consumer_pid;
     
-    
-    // --------- Command Execution -------
-        pid_t pid = spawn_stage_child(&pipeline->stages[i], &io, pipes, pipe_count);
-        
-        if (pid > 0) {
-            command_pids[command_count++] = pid;    // track child process for waitpid later
-        } else if (pid < 0) {
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            perror("cshell: fork failed");
             close_stage_io(&io, pipes, pipe_count);
             break;
         }
-
+        if (pid == 0) {  
+            if (io.stdin_fd != -1 && io.stdin_fd != STDIN_FILENO)
+                if (dup2(io.stdin_fd, STDIN_FILENO) == -1) 
+                    _exit(1);
+            
+            if (io.stdout_fd != -1 && io.stdout_fd != STDOUT_FILENO)
+                if (dup2(io.stdout_fd, STDOUT_FILENO) == -1) 
+                    _exit(1);
+            
+            close_all_pipes(pipes, pipe_count);     
+            execute_command_atomic(&cmd);
+        }
+            
+        // only first child sets the group pid, every other child joins the same group
+        if (pgid == 0) pgid = pid;  
+        (void)setpgid(pid, pgid);
+        command_pids[command_count++] = pid;    // track child process for waitpid later
+                 
         // close setup fds for stage before moving to next 
         close_stage_io(&io, pipes, pipe_count); 
     }
 
     close_all_pipes(pipes, pipe_count);
 
-    // wait for all stages to finish if foreground process
-    if (pipeline->isBackground == false) {
+    if (cmd_group->isBackground && command_count > 0) {
+        int job = jobs_add(pgid, cmd_group->list[0].argv[0], true);
+
+        for (int i = 0; i < command_count; i++)
+            jobs_add_process(job, command_pids[i], cmd_group->list[i].argv[0]);
+        
+        if (job >= 0) 
+            printf("[%d] %ld\n", jobs_number(job), (long)pgid);
+        fflush(stdout);
+    } 
+    else {
         for (int i = 0; i < command_count; i++) {
-            waitpid(command_pids[i], NULL, 0);
+            int status = 0;
+            waitpid(command_pids[i], &status, WUNTRACED);
+
+            if (WIFSTOPPED(status)) {
+                int job = jobs_add(pgid, cmd_group->list[0].argv[0], false);
+                for (int j = 0; j < command_count; j++) jobs_add_process(job, command_pids[j], cmd_group->list[j].argv[0]);
+                jobs_mark_stopped(job);
+                printf("[%d] + Stopped   %s\n", jobs_number(job), cmd_group->list[0].argv[0]);
+                break;
+            }
         }
-        for (int i = 0; i < helper_count; i++) {
+        for (int i = 0; i < helper_count; i++)
             waitpid(helper_pids[i], NULL, 0);
-        }
     }
 
     free(command_pids);
     free(helper_pids);
     free(pipes);
+    return unresolved;
 }
 
 static int prepare_stage_io(const SimpleCommand *cmd, int pipe_in, int pipe_out, int (*pipes)[2], int pipe_count, StageIO *io) {
@@ -373,71 +360,6 @@ static int prepare_stage_io(const SimpleCommand *cmd, int pipe_in, int pipe_out,
     return 0;
 }
 
-static pid_t spawn_stage_child(const SimpleCommand *cmd, const StageIO *io, int (*pipes)[2], int pipe_count) {
-    int status;
-    
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("cshell: fork failed");
-        return -1;
-    }
-
-    if (pid == 0) {
-
-        if (io->stdin_fd != -1 && io->stdin_fd != STDIN_FILENO) {
-            status = dup2(io->stdin_fd, STDIN_FILENO); 
-            if (status == -1) _exit(1);
-
-            close(io->stdin_fd);
-        }
-        if (io->stdout_fd != -1 && io->stdout_fd != STDOUT_FILENO) {
-            status = dup2(io->stdout_fd, STDOUT_FILENO); 
-            if (status == -1) _exit(1);
-            
-            close(io->stdout_fd);
-        }
-
-        close_all_pipes(pipes, pipe_count);
-
-        // PART B: BUILTINS
-        // execpt hop, all other builtins are run like any other child command with piped input and output
-        if (strcmp(cmd->argv[0], "peek") == 0) {
-            run_peek(cmd->argc, cmd->argv);
-            fflush(NULL);
-            _exit(0);
-        } 
-        else if (strcmp(cmd->argv[0], "locate") == 0) {
-            run_locate(cmd->argc, cmd->argv);
-            fflush(NULL);
-            _exit(0);
-        } 
-        else if (strcmp(cmd->argv[0], "reveal") == 0) {
-            run_reveal(cmd->argc, cmd->argv);
-            fflush(NULL);
-            _exit(0);
-        } 
-        else {
-        // not abuiltin
-        // use resolve_path + exec for arbitrary command
-            
-            char *cmd_path = resolve_path(cmd->argv[0]);
-            if (!cmd_path) {
-                printf("cshell: command not found (%s)\n", cmd->argv[0]);
-                free(cmd_path);
-                _exit(127);
-            }
-            
-            execv(cmd_path, cmd->argv);
-            // execv never reaches here unless it fails
-                // child exits after raising error
-            perror("cshell: exec failed");
-            free(cmd_path);
-            _exit(126);
-        }
-    }
-    return pid;
-}
-
 static char *resolve_path(const char *name) {
     bool pathenv_only = name[0] == '%';
 
@@ -535,4 +457,30 @@ static void close_all_pipes(int (*pipes)[2], int pipe_count) {
             pipes[i][1] = -1;
         }
     }
+}
+
+void execute_command(const CommandLine *cmd_line) {
+    if (!cmd_line) return;
+
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}  // non-blocking cleanup for already finished background children
+
+    for (int i = 0; i < cmd_line->count; i++) {
+
+        CommandGroup *cmd_group = &cmd_line->list[i];
+
+        // hop changes shell's working directory so must run in shell 
+        if (cmd_group->count == 1 && !cmd_group->isBackground && strcmp(cmd_group->list[0].argv[0], "hop") == 0) {
+            run_hop(cmd_group->list[0].argc, cmd_group->list[0].argv);
+            continue;
+        }
+        if (cmd_group->count == 1 && !cmd_group->isBackground && strcmp(cmd_group->list[0].argv[0], "activities") == 0) {
+            jobs_print();
+            continue;
+        }
+
+        if (execute_command_group(cmd_group))
+            break;
+    }
+
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
 }

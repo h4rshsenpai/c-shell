@@ -6,31 +6,30 @@
 
 #include "lexer.h"
 
-typedef struct {
-    char *path;
-    bool append;
-} Outfile;
+typedef struct { char *path; bool append; } Outfile;
 
 typedef struct {
-    char **argv;
     int argc;
-
-    char **ins;
     int n_ins;
-
-    Outfile *outs;
     int n_outs;
+    
+    char **ins;
+    char **argv;
+    Outfile *outs;
+    
 } SimpleCommand;
 
 typedef struct {
-    SimpleCommand *stages;
+    SimpleCommand *list;
     int count;
     bool isBackground;
-} Pipeline;
+
+} CommandGroup;
 
 typedef struct {
-    Pipeline *pipelines;
+    CommandGroup *list;
     int count;
+    
 } CommandLine;
 
 typedef struct {

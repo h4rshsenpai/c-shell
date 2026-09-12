@@ -4,11 +4,11 @@
 #include "lexer.h"
 #include "parser.h"
 
-static int parse_pipeline(ParserState *state, Pipeline *out_pipeline);
+static int parse_cmd_group(ParserState *state, CommandGroup *out_cmd_group);
 static int parse_single_command(ParserState *state, SimpleCommand *out_cmd);
 static int parse_command_suffix(ParserState *state, SimpleCommand *cmd);
-static int append_pipeline(CommandLine *line, Pipeline *pipeline);
-static int append_stage(Pipeline *pipeline, SimpleCommand *cmd);
+static int append_cmd_group(CommandLine *line, CommandGroup *cmd_group);
+static int append_stage(CommandGroup *cmd_group, SimpleCommand *cmd);
 static int append_word(char ***items, int *n, char *body);
 static int append_tgt(TokenType op, SimpleCommand* cmd, char *body);
 
@@ -28,24 +28,24 @@ static void free_single_command(SimpleCommand *cmd) {
     memset(cmd, 0, sizeof(*cmd));
 }
 
-static void free_pipeline(Pipeline *pipeline) {
-    if (!pipeline) return;
+static void free_cmd_group(CommandGroup *cmd_group) {
+    if (!cmd_group) return;
 
-    for (int i = 0; i < pipeline->count; i++) 
-        free_single_command(&pipeline->stages[i]);
+    for (int i = 0; i < cmd_group->count; i++) 
+        free_single_command(&cmd_group->list[i]);
 
-    free(pipeline->stages);
-    // zero out heap allocated pipeline 
-    memset(pipeline, 0, sizeof(*pipeline));
+    free(cmd_group->list);
+    // zero out heap allocated cmd_group 
+    memset(cmd_group, 0, sizeof(*cmd_group));
 }
 
 void free_parsed_command(CommandLine *line) {
     if (!line) return; 
 
     for (int i = 0; i < line->count; i++) 
-        free_pipeline(&line->pipelines[i]);
+        free_cmd_group(&line->list[i]);
 
-    free(line->pipelines); line->pipelines = NULL;
+    free(line->list); line->list = NULL;
     free(line); line = NULL;
 }
 
@@ -60,18 +60,18 @@ int run_parser(const Token *tokens, size_t n, CommandLine **out_line) {
     if (!line) return 2;
     
     while (state.pos < state.count) {
-        Pipeline pipeline = {0};
+        CommandGroup cmd_group = {0};
         TokenType separator; 
 
-        int status = parse_pipeline(&state, &pipeline);
+        int status = parse_cmd_group(&state, &cmd_group);
         if (status) {
             // invalid grammer or malloc error
-            free_pipeline(&pipeline); free_parsed_command(line);
+            free_cmd_group(&cmd_group); free_parsed_command(line);
             return status;
         }
 
         if(state.pos < state.count && state.tokens[state.pos].type == OP_AMP) {
-            pipeline.isBackground = true;
+            cmd_group.isBackground = true;
             separator = OP_AMP;
             state.pos++;
         } 
@@ -82,15 +82,15 @@ int run_parser(const Token *tokens, size_t n, CommandLine **out_line) {
         else { separator = NA;}
 
     
-        // parser checks for trailing ; or & at end of input
-        // if present, returns with error immediately and pipeline is not appended
-        if (state.pos >= state.count && separator != NA) {
-            free_pipeline(&pipeline);
+        // A trailing ampersand backgrounds the final cmd_group; a trailing
+        // semicolon has no command on its right and is invalid.
+        if (state.pos >= state.count && separator == OP_SEMI) {
+            free_cmd_group(&cmd_group);
             free_parsed_command(line);
             return 1; 
         }
-        if(append_pipeline(line, &pipeline) != 0) {
-            free_pipeline(&pipeline);
+        if(append_cmd_group(line, &cmd_group) != 0) {
+            free_cmd_group(&cmd_group);
             free_parsed_command(line);
             return 2;
         }
@@ -101,7 +101,7 @@ int run_parser(const Token *tokens, size_t n, CommandLine **out_line) {
     return 0;
 }
 
-static int parse_pipeline(ParserState *state, Pipeline *out_pipeline) {
+static int parse_cmd_group(ParserState *state, CommandGroup *out_cmd_group) {
     
     while (1) {
         // parse CMD at every stage 
@@ -113,13 +113,13 @@ static int parse_pipeline(ParserState *state, Pipeline *out_pipeline) {
             return status;
         }
         
-        // append parsed CMD to pipeline
-        if (append_stage(out_pipeline, &stage) != 0) {
+        // append parsed CMD to cmd_group
+        if (append_stage(out_cmd_group, &stage) != 0) {
             free_single_command(&stage);
             return 2;
         }
 
-        // end pipeline if EOF or next connector is not '|'
+        // end cmd_group if EOF or next connector is not '|'
         if (state->pos >= state->count || state->tokens[state->pos].type != OP_PIPE)
             return 0;   
 
@@ -185,29 +185,29 @@ static int parse_command_suffix(ParserState *state, SimpleCommand *cmd) {
     return 0;
 }
 
-static int append_pipeline(CommandLine *line, Pipeline *pipeline) {
-    Pipeline *tmp = realloc(line->pipelines, (size_t)(line->count + 1) * sizeof(*line->pipelines));
+static int append_cmd_group(CommandLine *line, CommandGroup *cmd_group) {
+    CommandGroup *tmp = realloc(line->list, (size_t)(line->count + 1) * sizeof(*line->list));
     if (!tmp)
         return 1;
 
-    line->pipelines = tmp;
-    line->pipelines[line->count] = *pipeline;
+    line->list = tmp;
+    line->list[line->count] = *cmd_group;
     line->count++;
 
-    // zero out pipeline to prevent double free 
-    memset(pipeline, 0, sizeof(*pipeline));
+    // zero out cmd_group to prevent double free 
+    memset(cmd_group, 0, sizeof(*cmd_group));
     return 0;
 }
 
 
-static int append_stage(Pipeline *pipeline, SimpleCommand *cmd) {
-    SimpleCommand *tmp = realloc(pipeline->stages, (size_t)(pipeline->count + 1) * sizeof(*pipeline->stages));
+static int append_stage(CommandGroup *cmd_group, SimpleCommand *cmd) {
+    SimpleCommand *tmp = realloc(cmd_group->list, (size_t)(cmd_group->count + 1) * sizeof(*cmd_group->list));
     if (!tmp)
         return 1;
 
-    pipeline->stages = tmp;
-    pipeline->stages[pipeline->count] = *cmd;
-    pipeline->count++;
+    cmd_group->list = tmp;
+    cmd_group->list[cmd_group->count] = *cmd;
+    cmd_group->count++;
 
     // zero out cmd to prevent double free
     memset(cmd, 0, sizeof(*cmd));
