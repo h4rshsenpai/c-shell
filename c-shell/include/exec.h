@@ -3,6 +3,6 @@
 
 #include "parser.h"
 
-void execute_command(const CommandLine *cmd);
+void execute_command_line(const CommandLine *cmd);
 
 #endif // EXEC_H

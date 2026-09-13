@@ -4,6 +4,7 @@
 #include "exec.h"
 #include "hop.h"
 #include "input.h"
+// #include "jobs.h"
 #include "lexer.h"
 #include "parser.h"
 #include "prompt.h"
@@ -16,6 +17,7 @@ int main(void) {
     
     shell_init();
     hop_init();
+    // jobs_init();
 
     while (1) {
         print_prompt();
@@ -78,8 +80,9 @@ int main(void) {
             return 1;
         }
         
-        // --> grammer is valid, parser passes the command model to exec
-        execute_command(cmd);
+        // grammer is valid
+        // --> parser passes command model to exec
+        execute_command_line(cmd);
         free_parsed_command(cmd);
         cmd = NULL;
 

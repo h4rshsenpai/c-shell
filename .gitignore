@@ -1,0 +1,8 @@
+## editor configs
+.clang-format
+.vscode/
+
+
+## temporary files and build objects
+*.o
+.hop_history

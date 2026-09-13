@@ -4,6 +4,7 @@
 #include "lexer.h"
 #include "parser.h"
 
+
 static int parse_cmd_group(ParserState *state, CommandGroup *out_cmd_group);
 static int parse_single_command(ParserState *state, SimpleCommand *out_cmd);
 static int parse_command_suffix(ParserState *state, SimpleCommand *cmd);

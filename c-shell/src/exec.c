@@ -24,193 +24,8 @@ typedef struct {
     pid_t consumer_pid;
 } StageIO;
 
-static void close_all_pipes(int (*pipes)[2], int pipe_count);
 static void close_stage_io(StageIO *io, int (*pipes)[2], int pipe_count);
-static char *resolve_path(const char *name);
-static int execute_command_group(const CommandGroup *pipeline);
-
-static int prepare_stage_io(const SimpleCommand *cmd, int pipe_in, int pipe_out, int (*pipes)[2], int pipe_count, StageIO *io);
-
-static bool command_is_resolvable(const SimpleCommand *cmd) {
-    if (strcmp(cmd->argv[0], "peek") == 0 ||
-        strcmp(cmd->argv[0], "locate") == 0 ||
-        strcmp(cmd->argv[0], "reveal") == 0)
-        return true;
-
-    char *cmd_path = resolve_path(cmd->argv[0]);
-    if (!cmd_path)
-        return false;
-
-    free(cmd_path);
-    return true;
-}
-
-static void execute_command_atomic(const SimpleCommand *cmd) {
-    // Run Built
-    
-    if (strcmp(cmd->argv[0], "peek") == 0) {
-        run_peek(cmd->argc, cmd->argv);
-        fflush(NULL);
-        _exit(0);
-    }
-    if (strcmp(cmd->argv[0], "locate") == 0) {
-        run_locate(cmd->argc, cmd->argv);
-        fflush(NULL);
-        _exit(0);
-    }
-    if (strcmp(cmd->argv[0], "reveal") == 0) {
-        run_reveal(cmd->argc, cmd->argv);
-        fflush(NULL);
-        _exit(0);
-    }
-
-    char *cmd_path = resolve_path(cmd->argv[0]);
-    if (!cmd_path) {
-        printf("cshell: command not found (%s)\n", cmd->argv[0]);
-        _exit(127);
-    }
-
-    execv(cmd_path, cmd->argv);
-    perror("cshell: exec failed");
-    free(cmd_path);
-    _exit(126);
-}
-
-static int execute_command_group(const CommandGroup *cmd_group) {
-/*
-    Runs cmd_group in stages and tracks command children 
-    plus any helper children created for I/O redirection.
-
-    --> For each stage
-        - start from the cmd_group pipe ends inherited from neighbors
-        - replace stdin with a feeder pipe when input redirection exists
-        - replace stdout with a consumer pipe when output redirection exists
-        - If setup fails for a stage, stop building the rest of the cmd_group.
-*/
-
-    int pipe_count = cmd_group->count - 1;
-    int (*pipes)[2] = NULL;
-
-    if (pipe_count > 0) {
-        pipes = malloc((size_t)pipe_count * sizeof(*pipes));
-        if (!pipes) return 0;
-
-        for (int i = 0; i < pipe_count; i++) {
-            pipes[i][0] = -1; pipes[i][1] = -1;
-            
-            if (pipe(pipes[i]) == -1) {
-                perror("cshell: pipe failed while executing command");
-                
-                close_all_pipes(pipes, i);  // reusable helper function for cleanup
-                free(pipes);
-                return 0;
-            }
-        }
-    }
-
-    pid_t *command_pids = NULL;
-    pid_t *helper_pids = NULL;
-
-    command_pids = calloc((size_t)cmd_group->count, sizeof(*command_pids));
-    helper_pids = calloc((size_t)cmd_group->count * 2, sizeof(*helper_pids));
-    if (!command_pids || !helper_pids) {
-        
-        free(command_pids); free(helper_pids);
-        close_all_pipes(pipes, pipe_count);
-        free(pipes);
-        return 0;
-    }
-    
-    int command_count = 0;
-    int helper_count = 0;
-    pid_t pgid = 0;
-    bool unresolved = false;
-
-    for (int i = 0; i < cmd_group->count; i++) {
-        SimpleCommand cmd = cmd_group->list[i];
-
-        if (!command_is_resolvable(&cmd)) {
-            printf("cshell: command not found (%s)\n", cmd.argv[0]);
-            unresolved = true;
-            break;
-        }
-
-        int pipe_in = (i == 0) ? -1 : pipes[i - 1][0];
-        int pipe_out = (i == cmd_group->count - 1) ? -1 : pipes[i][1];
-        StageIO io = {.stdin_fd = -1, .stdout_fd = -1, .feeder_pid = -1, .consumer_pid = -1};
-    
-        // set stdin and stdout for child process before forking
-        int setup_status = prepare_stage_io(&cmd, pipe_in, pipe_out, pipes, pipe_count, &io);
-        if (setup_status) {
-            close_stage_io(&io, pipes, pipe_count);
-            break;
-        }
-        if (io.feeder_pid > 0) helper_pids[helper_count++] = io.feeder_pid;
-        if (io.consumer_pid > 0) helper_pids[helper_count++] = io.consumer_pid;
-    
-        pid_t pid = fork();
-
-        if (pid < 0) {
-            perror("cshell: fork failed");
-            close_stage_io(&io, pipes, pipe_count);
-            break;
-        }
-        if (pid == 0) {  
-            if (io.stdin_fd != -1 && io.stdin_fd != STDIN_FILENO)
-                if (dup2(io.stdin_fd, STDIN_FILENO) == -1) 
-                    _exit(1);
-            
-            if (io.stdout_fd != -1 && io.stdout_fd != STDOUT_FILENO)
-                if (dup2(io.stdout_fd, STDOUT_FILENO) == -1) 
-                    _exit(1);
-            
-            close_all_pipes(pipes, pipe_count);     
-            execute_command_atomic(&cmd);
-        }
-            
-        // only first child sets the group pid, every other child joins the same group
-        if (pgid == 0) pgid = pid;  
-        (void)setpgid(pid, pgid);
-        command_pids[command_count++] = pid;    // track child process for waitpid later
-                 
-        // close setup fds for stage before moving to next 
-        close_stage_io(&io, pipes, pipe_count); 
-    }
-
-    close_all_pipes(pipes, pipe_count);
-
-    if (cmd_group->isBackground && command_count > 0) {
-        int job = jobs_add(pgid, cmd_group->list[0].argv[0], true);
-
-        for (int i = 0; i < command_count; i++)
-            jobs_add_process(job, command_pids[i], cmd_group->list[i].argv[0]);
-        
-        if (job >= 0) 
-            printf("[%d] %ld\n", jobs_number(job), (long)pgid);
-        fflush(stdout);
-    } 
-    else {
-        for (int i = 0; i < command_count; i++) {
-            int status = 0;
-            waitpid(command_pids[i], &status, WUNTRACED);
-
-            if (WIFSTOPPED(status)) {
-                int job = jobs_add(pgid, cmd_group->list[0].argv[0], false);
-                for (int j = 0; j < command_count; j++) jobs_add_process(job, command_pids[j], cmd_group->list[j].argv[0]);
-                jobs_mark_stopped(job);
-                printf("[%d] + Stopped   %s\n", jobs_number(job), cmd_group->list[0].argv[0]);
-                break;
-            }
-        }
-        for (int i = 0; i < helper_count; i++)
-            waitpid(helper_pids[i], NULL, 0);
-    }
-
-    free(command_pids);
-    free(helper_pids);
-    free(pipes);
-    return unresolved;
-}
+static void close_all_pipes(int (*pipes)[2], int pipe_count);
 
 static int prepare_stage_io(const SimpleCommand *cmd, int pipe_in, int pipe_out, int (*pipes)[2], int pipe_count, StageIO *io) {
     /* 
@@ -360,6 +175,45 @@ static int prepare_stage_io(const SimpleCommand *cmd, int pipe_in, int pipe_out,
     return 0;
 }
 
+static void close_stage_io(StageIO *io, int (*pipes)[2], int pipe_count) {
+    
+    if (io->stdin_fd != -1) {
+        close(io->stdin_fd);
+        for (int i = 0; i < pipe_count; i++) {
+            if (pipes[i][0] == io->stdin_fd)
+                pipes[i][0] = -1;
+            if (pipes[i][1] == io->stdin_fd)
+                pipes[i][1] = -1;
+        }
+
+        io->stdin_fd = -1;
+    } 
+    if (io->stdout_fd != -1) {
+        close(io->stdout_fd);
+        for (int i = 0; i < pipe_count; i++) {
+            if (pipes[i][0] == io->stdout_fd)
+                pipes[i][0] = -1;
+            if (pipes[i][1] == io->stdout_fd)
+                pipes[i][1] = -1;
+        }
+        io->stdout_fd = -1;
+    } 
+    return;
+}
+
+static void close_all_pipes(int (*pipes)[2], int pipe_count) {
+    for (int i = 0; i < pipe_count; i++) {
+        if (pipes[i][0] != -1) {
+            close(pipes[i][0]);
+            pipes[i][0] = -1;
+        }
+        if (pipes[i][1] != -1) {      
+            close(pipes[i][1]);
+            pipes[i][1] = -1;
+        }
+    }
+}
+
 static char *resolve_path(const char *name) {
     bool pathenv_only = name[0] == '%';
 
@@ -420,46 +274,188 @@ static char *resolve_path(const char *name) {
     return NULL;
 }
 
-static void close_stage_io(StageIO *io, int (*pipes)[2], int pipe_count) {
-    
-    if (io->stdin_fd != -1) {
-        close(io->stdin_fd);
-        for (int i = 0; i < pipe_count; i++) {
-            if (pipes[i][0] == io->stdin_fd)
-                pipes[i][0] = -1;
-            if (pipes[i][1] == io->stdin_fd)
-                pipes[i][1] = -1;
-        }
+static bool command_is_resolvable(const SimpleCommand *cmd) {
+    if (strcmp(cmd->argv[0], "peek") == 0 ||
+        strcmp(cmd->argv[0], "locate") == 0 ||
+        strcmp(cmd->argv[0], "reveal") == 0)
+        return true;
 
-        io->stdin_fd = -1;
-    } 
-    if (io->stdout_fd != -1) {
-        close(io->stdout_fd);
-        for (int i = 0; i < pipe_count; i++) {
-            if (pipes[i][0] == io->stdout_fd)
-                pipes[i][0] = -1;
-            if (pipes[i][1] == io->stdout_fd)
-                pipes[i][1] = -1;
-        }
-        io->stdout_fd = -1;
-    } 
-    return;
+    char *cmd_path = resolve_path(cmd->argv[0]);
+    if (!cmd_path)
+        return false;
+
+    free(cmd_path);
+    return true;
 }
 
-static void close_all_pipes(int (*pipes)[2], int pipe_count) {
-    for (int i = 0; i < pipe_count; i++) {
-        if (pipes[i][0] != -1) {
-            close(pipes[i][0]);
-            pipes[i][0] = -1;
-        }
-        if (pipes[i][1] != -1) {      
-            close(pipes[i][1]);
+static void execute_command(const SimpleCommand *cmd) {
+    // Run Built
+    
+    if (strcmp(cmd->argv[0], "peek") == 0) {
+        run_peek(cmd->argc, cmd->argv);
+        fflush(NULL);
+        _exit(0);
+    }
+    if (strcmp(cmd->argv[0], "locate") == 0) {
+        run_locate(cmd->argc, cmd->argv);
+        fflush(NULL);
+        _exit(0);
+    }
+    if (strcmp(cmd->argv[0], "reveal") == 0) {
+        run_reveal(cmd->argc, cmd->argv);
+        fflush(NULL);
+        _exit(0);
+    }
+
+    char *cmd_path = resolve_path(cmd->argv[0]);
+    if (!cmd_path) {
+        printf("cshell: command not found (%s)\n", cmd->argv[0]);
+        _exit(127);
+    }
+
+    execv(cmd_path, cmd->argv);
+    perror("cshell: exec failed");
+    free(cmd_path);
+    _exit(126);
+}
+
+static int execute_command_group(const CommandGroup *cmd_group) {
+/*
+    Runs cmd_group in stages and tracks command children 
+    plus any helper children created for I/O redirection.
+
+    --> For each stage
+        - start from the cmd_group pipe ends inherited from neighbors
+        - replace stdin with a feeder pipe when input redirection exists
+        - replace stdout with a consumer pipe when output redirection exists
+        - If setup fails for a stage, stop building the rest of the cmd_group.
+*/
+    pid_t pgid = 0;
+    int pipe_count = cmd_group->count - 1;
+    int (*pipes)[2] = NULL;
+
+    if (pipe_count > 0) {
+
+        pipes = malloc((size_t)pipe_count * sizeof(*pipes));
+        if (!pipes) return 0;
+
+        for (int i = 0; i < pipe_count; i++) {
+
+            pipes[i][0] = -1; 
             pipes[i][1] = -1;
+            
+            if (pipe(pipes[i]) == -1) {
+                perror("cshell: pipe failed while executing command");
+                
+                close_all_pipes(pipes, i);
+                free(pipes);
+                return 0;
+            }
         }
     }
+
+    pid_t *command_pids = NULL;
+    pid_t *helper_pids = NULL;
+    command_pids = calloc((size_t)cmd_group->count, sizeof(*command_pids));
+    helper_pids = calloc((size_t)cmd_group->count * 2, sizeof(*helper_pids));
+
+    if (!command_pids || !helper_pids) {    
+        
+        free(command_pids); free(helper_pids);
+        close_all_pipes(pipes, pipe_count);
+        free(pipes);
+        return 0;
+    }
+    
+    int command_count = 0;
+    int helper_count = 0;
+    bool unresolved = false;
+
+    for (int i = 0; i < cmd_group->count; i++) {
+
+        SimpleCommand cmd = cmd_group->list[i];
+        
+        if (command_is_resolvable(&cmd) != true) {    
+            unresolved = true;
+            printf("cshell: command not found (%s)\n", cmd.argv[0]);
+            break;
+        }
+
+        // shell sets stdin and stdout for child process before forking
+        
+        int pipe_in = (i == 0) ? -1 : pipes[i - 1][0];
+        int pipe_out = (i == cmd_group->count - 1) ? -1 : pipes[i][1];
+        StageIO io = {.stdin_fd = -1, .stdout_fd = -1, .feeder_pid = -1, .consumer_pid = -1};
+    
+        int setup_status = prepare_stage_io(&cmd, pipe_in, pipe_out, pipes, pipe_count, &io);
+        if (setup_status) {
+            close_stage_io(&io, pipes, pipe_count);
+            break;
+        }
+        if (io.feeder_pid > 0) helper_pids[helper_count++] = io.feeder_pid;
+        if (io.consumer_pid > 0) helper_pids[helper_count++] = io.consumer_pid;
+    
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            perror("cshell: fork failed");
+            close_stage_io(&io, pipes, pipe_count);
+            break;
+        }
+        if (pid == 0) {  
+            if (io.stdin_fd != -1 && io.stdin_fd != STDIN_FILENO) {
+                if (dup2(io.stdin_fd, STDIN_FILENO) == -1) 
+                    _exit(1);
+            }
+
+            if (io.stdout_fd != -1 && io.stdout_fd != STDOUT_FILENO) {    
+                if (dup2(io.stdout_fd, STDOUT_FILENO) == -1) 
+                    _exit(1);
+            }
+            
+             // first child sets the group pid, every other child joins the same group
+             if (pgid == 0) pgid = pid;                                               
+             (void)setpgid(pid, pgid);                                                
+
+            close_all_pipes(pipes, pipe_count);  
+            execute_command(&cmd);
+        }
+            
+        command_pids[command_count++] = pid;    // track child process for waitpid later         
+        close_stage_io(&io, pipes, pipe_count); 
+    }
+
+    close_all_pipes(pipes, pipe_count);
+    
+    if (cmd_group->isBackground == false) {
+        
+        int status;
+        for (int i = 0; i < command_count; i++) {
+            waitpid(command_pids[i], &status, WUNTRACED);
+        
+            // retain job if stopped through ctrl+C
+        }
+    }
+    else {
+        // shell doesn't wait for completion, instead records the processes in list
+        int job = jobs_add(pgid, true);
+        if (job < 0) return 1;
+
+        for (int i = 1; i < command_count; i++) {
+            if(jobs_add_process(job, command_pids[i], cmd_group->list[i].argv[0]) != 0)
+               return 1;
+        }
+        printf("[%d] %d\n", job, command_pid[0]);
+        fflush(stdout);
+    }
+
+    free(command_pids);
+    free(helper_pids);
+    free(pipes);
+    return unresolved;
 }
 
-void execute_command(const CommandLine *cmd_line) {
+void execute_command_line(const CommandLine *cmd_line) {
     if (!cmd_line) return;
 
     while (waitpid(-1, NULL, WNOHANG) > 0) {}  // non-blocking cleanup for already finished background children
@@ -467,14 +463,16 @@ void execute_command(const CommandLine *cmd_line) {
     for (int i = 0; i < cmd_line->count; i++) {
 
         CommandGroup *cmd_group = &cmd_line->list[i];
-
+    
         // hop changes shell's working directory so must run in shell 
         if (cmd_group->count == 1 && !cmd_group->isBackground && strcmp(cmd_group->list[0].argv[0], "hop") == 0) {
             run_hop(cmd_group->list[0].argc, cmd_group->list[0].argv);
             continue;
         }
+
+        // activities is trivial so doesn't require a forked process overhead
         if (cmd_group->count == 1 && !cmd_group->isBackground && strcmp(cmd_group->list[0].argv[0], "activities") == 0) {
-            jobs_print();
+            // jobs_print();
             continue;
         }
 

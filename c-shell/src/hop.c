@@ -41,12 +41,12 @@ static void resolve_target(const char *name, char *target, size_t size);
 static int try_hop(const char *path);
 static int record_hop(const char *path);
 
-const char *hop_prev_dir(void) {
+const char *hop_prev_dir() {
     if (!HAS_PREV) return NULL;
     return PREV_DIR;
 }
 
-void hop_init(void) {
+void hop_init() {
     const char *shell_home = shell_get_home();
     // if no home is initilaized for some reason, hop will fallback to non-persistent frecency using stack memory
     if (!shell_home) {

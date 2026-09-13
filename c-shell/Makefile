@@ -12,12 +12,13 @@ SRCS = $(SRC_DIR)/main.c \
 	   $(SRC_DIR)/input.c \
 	   $(SRC_DIR)/lexer.c \
 	   $(SRC_DIR)/parser.c \
- 	   $(SRC_DIR)/exec.c \
+	   $(SRC_DIR)/exec.c \
 	   $(SRC_DIR)/redir.c \
 	   $(SRC_DIR)/hop.c \
 	   $(SRC_DIR)/locate.c \
 	   $(SRC_DIR)/reveal.c \
 	   $(SRC_DIR)/peek.c \
+	   $(SRC_DIR)/jobs.c \
 
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
