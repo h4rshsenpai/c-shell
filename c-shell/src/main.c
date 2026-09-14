@@ -4,7 +4,7 @@
 #include "exec.h"
 #include "hop.h"
 #include "input.h"
-// #include "jobs.h"
+#include "jobs.h"
 #include "lexer.h"
 #include "parser.h"
 #include "prompt.h"
@@ -17,21 +17,28 @@ int main(void) {
     
     shell_init();
     hop_init();
-    // jobs_init();
+    jobs_init();
 
     while (1) {
+        jobs_reap_and_report();
         print_prompt();
 
         int status = read_user_input(&input, &len);
         
-        if (status == 1) {   // User pressed Ctrl+D
+        if (status == INPUT_INTERRUPTED) {
+            fflush(stdout);
+            jobs_reap_and_report();
+            
+            continue;
+        }
+        if (status == INPUT_EOF) {   // User pressed Ctrl+D
             puts("Logging out");
             
             hop_shutdown();
             free(input);    
             return 0;
         }
-        if (status == 2) {  // read_user_input failed
+        if (status == INPUT_ERROR) {  // read_user_input failed
             perror("cshell: getline failed during user input");
             
             free(input); input = NULL;
@@ -68,12 +75,11 @@ int main(void) {
         tokens = NULL;
 
         if (parse_status == 1) {    // invalid grammar
-
             puts("cshell: invalid syntax");
             free(cmd); cmd = NULL;
             continue;
         }
-        if (parse_status == 2) {    // run_parser failed
+        else if (parse_status == 2) {    // run_parser failed
             perror("cshell: out of memory");
             hop_shutdown();
             free(cmd); cmd = NULL;
@@ -89,6 +95,7 @@ int main(void) {
         free(input);
         input = NULL;
     }
+
+    jobs_shutdown();
     return 0;
 }
-    

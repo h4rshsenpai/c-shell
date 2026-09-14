@@ -3,6 +3,13 @@
 
 #include <stddef.h> 
 
+enum {
+    INPUT_OK,
+    INPUT_EOF,
+    INPUT_ERROR,
+    INPUT_INTERRUPTED,
+};
+
 // consume user input from terminal, return appropriate error codes
 int read_user_input(char **out_line, size_t *out_len);
 
